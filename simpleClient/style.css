@@ -1,0 +1,157 @@
+* {
+  box-sizing: border-box;
+  overscroll-behavior: contain;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", "Hiragino Sans", sans-serif;
+  background: #121212;
+  color: #eee;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 18px;
+}
+
+main {
+  width: 100dvw;
+  height: 100dvh;
+}
+
+.side {
+    position: fixed;
+    width: 400px;
+    height: 100%;
+    top: 0;
+    right: 0;
+    background: #121212;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+    row-rule: 1px solid gray;
+    overflow-y: auto;
+    z-index: 1000;
+
+    &.closing {
+      display: none;
+    }
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.controls label {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  color: #aaa;
+  gap: 4px;
+}
+
+.controls .checkbox-label {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.controls input {
+  padding: 6px 8px;
+  background: #1e1e1e;
+  border: 1px solid #444;
+  color: #eee;
+  border-radius: 4px;
+}
+
+button {
+  padding: 8px 16px;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+  background: #3a82f7;
+  color: white;
+  font-weight: 600;
+}
+
+button:disabled {
+  background: #444;
+  cursor: not-allowed;
+}
+
+.status {
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+}
+
+.status--idle {
+  background: #444;
+}
+
+.status--connecting {
+  background: #b8860b;
+}
+
+.status--connected {
+  background: #2e7d32;
+}
+
+.status--error {
+  background: #b71c1c;
+}
+
+.video-wrap {
+    width: 100%;
+    height: 100%;
+    background: black;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  outline: none;
+  cursor: none;
+  touch-action: none;
+  /* aspect-ratio は app.js の loadedmetadata/resize イベントで動的に設定する。
+     これにより配信解像度と表示ボックスの比率が一致し、レターボックス/ピラーボックス
+     (黒帯)が発生しなくなる。 */
+  object-fit: contain;
+}
+
+.log-wrap {
+  background: #1e1e1e;
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.log-wrap h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  color: #aaa;
+}
+
+#log {
+  margin: 0;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 12px;
+  color: #9ccc65;
+  white-space: pre-wrap;
+}
+
+#openBtn {
+    position: fixed;
+    top: 0;
+    right: 0;
+}

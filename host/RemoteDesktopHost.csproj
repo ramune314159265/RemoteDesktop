@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- webrtcbin / d3d11screencapturesrc / wasapisrc は Windows x64 前提 -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Kestrel (ws:// と wss:// の同時待受) のため ASP.NET Core 共有フレームワークを参照 -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      GstSharpBundle: .NET 8 対応版の GStreamer C# バインディング(バイナリ同梱)。
+      パイプライン構築・状態管理・バス監視にのみ使用する。
+      webrtcbin のシグナル(on-negotiation-needed 等)は
+      GIR に定義が存在しないため、GstNativeInterop.cs 内で
+      libgobject / libgstreamer / libgstwebrtc / libgstsdp を
+      直接 P/Invoke して制御する。
+    -->
+    <PackageReference Include="GstSharpBundle" Version="1.24.3-preview6" />
+  </ItemGroup>
+
+</Project>

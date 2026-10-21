@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Remote Desktop Viewer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+  <main>
+    <div class="side">
+      <button id="closeBtn">閉じる</button>
+      <section class="controls">
+        <label>
+          シグナリングサーバ (ws://host:port/signaling)
+          <input type="text" id="wsUrl" value="ws://" />
+        </label>
+        <label>
+          FPS
+          <input type="number" id="fpsInput" value="60" min="1" max="60" />
+        </label>
+        <label>
+          コーデック
+          <select id="codecSelect">
+            <option value="hevc">H.265 (HEVC, ブラウザ対応要確認)</option>
+            <option value="h264">H.264</option>
+          </select>
+        </label>
+        <button id="connectBtn">接続</button>
+        <button id="disconnectBtn" disabled>切断</button>
+        <span id="status" class="status status--idle">未接続</span>
+      </section>
+
+      <section class="controls">
+        <label>
+          ビットレート (kbps)
+          <input type="number" id="bitrateInput" value="4000" min="500" max="20000" step="500" />
+        </label>
+        <button id="applyBitrateBtn">適用</button>
+
+        <label class="checkbox-label">
+          <input type="checkbox" id="muteCheckbox" />
+          ミュート
+        </label>
+      </section>
+
+      <section class="controls">
+        <button id="listMonitorsBtn">モニター一覧取得</button>
+        <select id="monitorSelect" style="min-width: 240px"></select>
+        <button id="switchMonitorBtn">モニターに切り替え</button>
+
+        <button id="listWindowsBtn">ウィンドウ一覧取得</button>
+        <select id="windowSelect" style="min-width: 240px"></select>
+        <button id="switchWindowBtn">ウィンドウに切り替え</button>
+
+        <label>
+          入力
+          <select id="inputSelect">
+            <option value="auto">自動</option>
+            <option value="mouse">ダイレクトマウス</option>
+            <option value="touch">タッチ</option>
+          </select>
+        </label>
+
+        <button id="forceFitBtn">解像度強制フィット</button>
+      </section>
+
+      <section class="log-wrap">
+        <h2>ログ</h2>
+        <pre id="log"></pre>
+      </section>
+    </div>
+
+    <div class="video-wrap">
+      <button id="openBtn">...</button>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+
+</html>
