@@ -771,7 +771,7 @@ internal sealed class WebRtcSession : IDisposable
             // (capture-api=0 の Desktop Duplication API はウィンドウ単位キャプチャ非対応)
             // ※ プロパティ名/値は環境のGStreamerバージョンで `gst-inspect-1.0 d3d11screencapturesrc`
             //    を実行し実際の名称と一致するか確認すること。
-            : $"d3d11screencapturesrc name=capturesrc capture-api=1 monitor-index=0 show-cursor=true do-timestamp=true ! video/x-raw(memory:D3D11Memory),framerate={config.Framerate}/1 ! d3d11convert ! d3d11download !";
+            : $"d3d11screencapturesrc name=capturesrc capture-api=1 monitor-index=0 show-cursor=true do-timestamp=true ! video/x-raw(memory:D3D11Memory),framerate={config.Framerate}/1 ! d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12 ! d3d11download !";
 
         var audioSource = config.UseTestSource
             ? "audiotestsrc name=audiosrc is-live=true wave=sine !"

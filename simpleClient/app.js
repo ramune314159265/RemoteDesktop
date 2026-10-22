@@ -689,6 +689,12 @@ setInterval(async () => {
   const videoDelay = averageJitterBufferDelayMs(cur.video, prevInbound.video);
   const audioDelay = averageJitterBufferDelayMs(cur.audio, prevInbound.audio);
 
+  // 受信側のデコード時間(1フレームあたり)。ここが大きければ受信端末のデコードが律速。
+  const decodedFrames = delta(cur.video, prevInbound.video, "framesDecoded");
+  const decodeMs = decodedFrames > 0
+    ? (delta(cur.video, prevInbound.video, "totalDecodeTime") / decodedFrames) * 1000
+    : null;
+
   if (videoDelay !== null) {
     const fmt = (v) => (v === null ? "n/a" : `${Math.round(v)}ms`);
     const detail =
@@ -698,7 +704,10 @@ setInterval(async () => {
       `lost=${delta(cur.video, prevInbound.video, "packetsLost")}, ` +
       `nack=${delta(cur.video, prevInbound.video, "nackCount")}, ` +
       `pli=${delta(cur.video, prevInbound.video, "pliCount")}, ` +
-      `dropped=${delta(cur.video, prevInbound.video, "framesDropped")}`;
+      `dropped=${delta(cur.video, prevInbound.video, "framesDropped")}, ` +
+      `recvFps=${(delta(cur.video, prevInbound.video, "framesReceived") / (STATS_INTERVAL_MS / 1000)).toFixed(1)}, ` +
+      `decode=${decodeMs === null ? "n/a" : decodeMs.toFixed(1) + "ms"}, ` +
+      `res=${cur.video.frameWidth ?? "?"}x${cur.video.frameHeight ?? "?"}`;
 
     if (videoDelay > LAG_WARN_MS) {
       log(`[Stats] ラグ検知: ${detail}`);
