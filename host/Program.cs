@@ -116,6 +116,8 @@ internal static class Program
             {
                 StunServer = config.StunServer,
                 UseTestSource = config.UseTestSource,
+                // ?audio=0 で音声パイプラインごと省く(映像ラグの原因切り分け用: A/V同期待ちの有無を確認できる)
+                EnableAudio = !(client.QueryParams.TryGetValue("audio", out var audioStr) && audioStr == "0"),
                 Framerate = client.QueryParams.TryGetValue("fps", out var fpsStr) && int.TryParse(fpsStr, out var fps)
                     ? Math.Clamp(fps, 1, 60)
                     : config.Framerate,

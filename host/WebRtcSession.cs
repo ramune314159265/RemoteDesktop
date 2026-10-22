@@ -775,7 +775,7 @@ internal sealed class WebRtcSession : IDisposable
 
         var audioSource = config.UseTestSource
             ? "audiotestsrc name=audiosrc is-live=true wave=sine !"
-            : "wasapisrc name=audiosrc loopback=true do-timestamp=true !";
+            : "wasapisrc name=audiosrc loopback=true low-latency=true do-timestamp=true !";
 
         var videoCapsAndPay = config.Codec == VideoCodec.Hevc
             // H.265/HEVC: libx264/nvh264enc よりも効率的だが、WebRTCでのブラウザ対応は
@@ -784,7 +784,7 @@ internal sealed class WebRtcSession : IDisposable
             ? "rtph265pay name=vpay config-interval=-1 pt=96 aggregate-mode=zero-latency !"
             : "video/x-h264,profile=baseline ! rtph264pay name=vpay config-interval=-1 pt=96 aggregate-mode=zero-latency !";
 
-        return string.Join(" ", new[]
+        var parts = new List<string>
         {
             $"webrtcbin name=sendrecv bundle-policy=max-bundle stun-server={config.StunServer}",
 
@@ -808,17 +808,26 @@ internal sealed class WebRtcSession : IDisposable
             //  分割されるため、バッファ数で制限するとキーフレーム送出が不必要に詰まる)
             "queue name=vqueue2 max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 ! sendrecv.",
 
+        };
+
+        if (config.EnableAudio)
+        {
+            parts.AddRange(new[]
+            {
             // 音声: 既定の再生デバイスをループバックキャプチャして Opus でエンコードし RTP 化
-            // volume 要素でミュート/音量を制御できるようにする。
-            audioSource,
-            "audioconvert ! audioresample !",
-            "volume name=vol !",
-            "queue max-size-buffers=1 leaky=downstream !",
-            "opusenc bitrate=64000 !",
-            "rtpopuspay pt=97 !",
-            // 音声も同様に上限を100msに絞る。音声パケットは1つ落ちても一瞬のノイズで済むため leaky にする。
-            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 leaky=downstream ! sendrecv.",
-        });
+                // volume 要素でミュート/音量を制御できるようにする。
+                audioSource,
+                "audioconvert ! audioresample !",
+                "volume name=vol !",
+                "queue max-size-buffers=1 leaky=downstream !",
+                "opusenc bitrate=64000 !",
+                "rtpopuspay pt=97 !",
+                // 音声も同様に上限を100msに絞る。音声パケットは1つ落ちても一瞬のノイズで済むため leaky にする。
+                "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 leaky=downstream ! sendrecv.",
+            });
+        }
+
+        return string.Join(" ", parts);
     }
 
     /// <summary>
@@ -1077,6 +1086,9 @@ internal sealed class HostConfig
     /// <summary>true の場合、videotestsrc/audiotestsrc を使い d3d11/wasapi を経由しない
     /// 切り分けテスト用パイプラインになる。</summary>
     public bool UseTestSource { get; set; } = false;
+
+    /// <summary>false の場合は音声パイプラインを構築しない(接続クエリ ?audio=0)。</summary>
+    public bool EnableAudio { get; set; } = true;
 
     /// <summary>キャプチャフレームレート(接続時にクエリパラメータ ?fps=60 で上書き可能)。</summary>
     public int Framerate { get; set; } = 30;
