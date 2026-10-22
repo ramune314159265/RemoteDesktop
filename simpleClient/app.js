@@ -3,6 +3,7 @@ const fpsInput = document.getElementById("fpsInput");
 const codecSelect = document.getElementById("codecSelect");
 const inputSelect = document.getElementById("inputSelect");
 const audioCheck = document.getElementById("audioCheck");
+const playoutCheck = document.getElementById("playoutCheck");
 const connectBtn = document.getElementById("connectBtn");
 const disconnectBtn = document.getElementById("disconnectBtn");
 const statusEl = document.getElementById("status");
@@ -121,7 +122,7 @@ function connect() {
   const fps = parseInt(fpsInput.value, 10) || 30;
   const codec = codecSelect.value;
   const separator = baseUrl.includes("?") ? "&" : "?";
-  const url = `${baseUrl}${separator}fps=${fps}&codec=${encodeURIComponent(codec)}&audio=${audioCheck.checked ? 1 : 0}`;
+  const url = `${baseUrl}${separator}fps=${fps}&codec=${encodeURIComponent(codec)}&audio=${audioCheck.checked ? 1 : 0}&playout=${playoutCheck.checked ? 1 : 0}`;
 
   setStatus("接続中...", "connecting");
   pc = createPeerConnection();

@@ -38,6 +38,8 @@ internal sealed class WebRtcSession : IDisposable
     private Element? _videoQueue1Element;
     private Element? _videoEncoderElement;
     private Element? _videoPayloaderElement;
+    private PlayoutDelayExtension? _playoutDelay;
+    private int _offeredPlayoutExtId;
     private Element? _videoQueue2Element;
     private Element? _videoConvertElement;
     private Element? _videoCropElement;
@@ -886,6 +888,23 @@ internal sealed class WebRtcSession : IDisposable
             var sdpText = GstNativeInterop.SessionDescriptionToSdpText(offerDescPtr);
             Console.WriteLine("[WebRTC] Offer SDP:\n" + sdpText);
 
+            // 低遅延モード: ブラウザへ送る SDP テキストにだけ playout-delay の extmap を追加する
+            // (webrtcbin 側のローカル記述は無変更)。詳細は PlayoutDelayExtension.cs 参照。
+            if (_config.EnablePlayoutDelay)
+            {
+                var munged = PlayoutDelayExtension.AddExtmapToOffer(sdpText, out var offeredId);
+                if (munged is not null)
+                {
+                    sdpText = munged;
+                    _offeredPlayoutExtId = offeredId;
+                    Console.WriteLine($"[PlayoutDelay] オファーに extmap を追加 (id={offeredId})");
+                }
+                else
+                {
+                    Console.WriteLine("[PlayoutDelay] オファーへの extmap 追加をスキップ(映像セクション無し/空きID無し)");
+                }
+            }
+
             // ここでの offerDescPtr は g_value_dup_boxed() で複製した「自分の所有物」なので、
             // 公式サンプルと同じく emit -> interrupt -> unref -> free の同期パターンでよい。
             var localPromise = GstNativeInterop.PromiseNew();
@@ -1046,6 +1065,21 @@ internal sealed class WebRtcSession : IDisposable
 
     private void HandleAnswer(string sdpText)
     {
+        if (_config.EnablePlayoutDelay && _offeredPlayoutExtId > 0)
+        {
+            // webrtcbin は未知の拡張を扱えないので、アンサーから該当行を取り除いて渡す
+            sdpText = PlayoutDelayExtension.StripExtmapFromAnswer(sdpText, out var answeredId);
+            if (answeredId > 0 && _videoPayloaderElement is not null)
+            {
+                _playoutDelay = new PlayoutDelayExtension();
+                _playoutDelay.Attach(_videoPayloaderElement.Handle, answeredId);
+            }
+            else
+            {
+                Console.WriteLine("[PlayoutDelay] ブラウザが playout-delay 拡張を受け入れませんでした(未ネゴシエーション)。通常動作します");
+            }
+        }
+
         var sdpMessagePtr = GstNativeInterop.ParseSdp(sdpText);
         var answerDescPtr = GstNativeInterop.WebRtcSessionDescriptionNew(
             GstNativeInterop.WebRTCSDPType.Answer, sdpMessagePtr);
@@ -1068,6 +1102,7 @@ internal sealed class WebRtcSession : IDisposable
         // 引き継ぎ(takeover)と Disconnected の両方から呼ばれうるので、二重実行を防ぐ
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
         RestoreOriginalWindowRectIfNeeded();
+        _playoutDelay?.Detach();
         _resizeWatchTimer?.Dispose();
         _client.MessageReceived -= OnSignalingMessage;
         if (_pipeline is not null)
@@ -1089,6 +1124,9 @@ internal sealed class HostConfig
 
     /// <summary>false の場合は音声パイプラインを構築しない(接続クエリ ?audio=0)。</summary>
     public bool EnableAudio { get; set; } = true;
+
+    /// <summary>true の場合、RTP の playout-delay 拡張(min=max=0)で受信側に低遅延再生を指示する(接続クエリ ?playout=0 で無効化)。</summary>
+    public bool EnablePlayoutDelay { get; set; } = true;
 
     /// <summary>キャプチャフレームレート(接続時にクエリパラメータ ?fps=60 で上書き可能)。</summary>
     public int Framerate { get; set; } = 30;
