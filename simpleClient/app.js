@@ -696,7 +696,13 @@ setInterval(async () => {
     : null;
 
   if (videoDelay !== null) {
-    const fmt = (v) => (v === null ? "n/a" : `${Math.round(v)}ms`);
+    const fmt = (v) => (v === null || v === undefined ? "n/a" : `${Math.round(v)}ms`);
+    const perFrame = (key) => {
+      const n = delta(cur.video, prevInbound.video, "jitterBufferEmittedCount");
+      return cur.video[key] === undefined || n <= 0 ? null : (delta(cur.video, prevInbound.video, key) / n) * 1000;
+    };
+    const targetDelay = perFrame("jitterBufferTargetDelay");
+    const minDelay = perFrame("jitterBufferMinimumDelay");
     const detail =
       `video buffer=${fmt(videoDelay)}, audio buffer=${fmt(audioDelay)}, ` +
       `rtt=${rttMs === null ? "n/a" : Math.round(rttMs) + "ms"}, ` +
@@ -707,7 +713,10 @@ setInterval(async () => {
       `dropped=${delta(cur.video, prevInbound.video, "framesDropped")}, ` +
       `recvFps=${(delta(cur.video, prevInbound.video, "framesReceived") / (STATS_INTERVAL_MS / 1000)).toFixed(1)}, ` +
       `decode=${decodeMs === null ? "n/a" : decodeMs.toFixed(1) + "ms"}, ` +
-      `res=${cur.video.frameWidth ?? "?"}x${cur.video.frameHeight ?? "?"}`;
+      `res=${cur.video.frameWidth ?? "?"}x${cur.video.frameHeight ?? "?"}, ` +
+      `jitter=${cur.video.jitter !== undefined ? Math.round(cur.video.jitter * 1000) + "ms" : "n/a"}, ` +
+      `target=${fmt(targetDelay)}, minDelay=${fmt(minDelay)}, ` +
+      `ua=${navigator.userAgent.includes("Chrome") ? "Chrome系" : navigator.userAgent.includes("Safari") ? "Safari" : "other"}`;
 
     if (videoDelay > LAG_WARN_MS) {
       log(`[Stats] ラグ検知: ${detail}`);
