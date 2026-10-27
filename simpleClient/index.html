@@ -29,12 +29,12 @@
           </select>
         </label>
         <label>
-          <input type="checkbox" id="audioCheck" checked />
-          音声
-        </label>
-        <label>
           <input type="checkbox" id="playoutCheck" checked />
           低遅延モード
+        </label>
+        <label>
+          接続時テスト映像(ms)
+          <input type="number" id="burstInput" value="0" min="0" max="10000" step="100" style="width: 5em" />
         </label>
         <button id="connectBtn">接続</button>
         <button id="disconnectBtn" disabled>切断</button>

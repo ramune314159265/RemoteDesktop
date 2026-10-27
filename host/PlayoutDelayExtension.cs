@@ -149,6 +149,7 @@ internal sealed class PlayoutDelayExtension
     private long _failures;
     private bool _loggedFirstSuccess;
 
+
     public PlayoutDelayExtension()
     {
         _probeCallback = OnProbe;
@@ -158,7 +159,7 @@ internal sealed class PlayoutDelayExtension
     public void Attach(IntPtr payloaderElement, int extId)
     {
         if (_pad != IntPtr.Zero) return; // 二重 Attach 防止
-        _extId = extId;
+        _extId = extId; // 0 の場合は診断カウントのみ(拡張は書かない)
         var pad = gst_element_get_static_pad(payloaderElement, "src");
         if (pad == IntPtr.Zero)
         {
@@ -187,11 +188,12 @@ internal sealed class PlayoutDelayExtension
         try
         {
             var extId = _extId;
-            if (extId <= 0) return GST_PAD_PROBE_OK;
 
             var type = (uint)Marshal.ReadInt32(info, InfoTypeOffset);
             var data = Marshal.ReadIntPtr(info, InfoDataOffset);
             if (data == IntPtr.Zero) return GST_PAD_PROBE_OK;
+
+            if (extId <= 0) return GST_PAD_PROBE_OK;
 
             if ((type & GST_PAD_PROBE_TYPE_BUFFER_LIST) != 0)
             {

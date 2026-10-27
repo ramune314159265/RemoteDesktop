@@ -330,4 +330,32 @@ internal static class GstNativeInterop
         gst_version(out var major, out var minor, out var micro, out var nano);
         return nano == 0 ? $"{major}.{minor}.{micro}" : $"{major}.{minor}.{micro} (nano {nano})";
     }
+
+    // ---- ポインタ型プロパティ / caps 文字列の設定 --------------------------------------
+
+    [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_object_set")]
+    private static extern void g_object_set_ptr(IntPtr obj, string propertyName, IntPtr value, IntPtr terminator);
+
+    [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gst_caps_from_string(string str);
+
+    /// <summary>GObject のポインタ(オブジェクト)型プロパティを設定する(例: input-selector の active-pad)。</summary>
+    public static void SetObject(IntPtr obj, string propertyName, IntPtr value)
+        => g_object_set_ptr(obj, propertyName, value, IntPtr.Zero);
+
+    /// <summary>capsfilter 等の "caps" プロパティを文字列から設定する。</summary>
+    public static bool SetCapsFromString(IntPtr element, string caps)
+    {
+        var c = gst_caps_from_string(caps);
+        if (c == IntPtr.Zero) return false;
+        try
+        {
+            g_object_set_ptr(element, "caps", c, IntPtr.Zero);
+            return true;
+        }
+        finally
+        {
+            gst_caps_unref(c);
+        }
+    }
 }

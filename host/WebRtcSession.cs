@@ -261,6 +261,46 @@ internal sealed class WebRtcSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// 実験機能: 接続開始時からテスト映像(動くボール)とテスト音(サイン波)を流し、
+    /// DataChannel が開いてから指定ミリ秒後にキャプチャ映像/実音声へ切り替える。
+    /// (最初のテスト映像に切り替わっている状態はパイプライン構築時に作ってある。)
+    /// </summary>
+    private async Task StartupBurstAsync()
+    {
+        try
+        {
+            var vsel = _pipeline?.GetByName("vsel");
+            var capPad = _pipeline?.GetByName("capdl")?.GetStaticPad("src")?.Peer;
+            var asel = _pipeline?.GetByName("asel");
+            var realAudioPad = _pipeline?.GetByName("arealcaps")?.GetStaticPad("src")?.Peer;
+            if (vsel is null || capPad is null)
+            {
+                Console.WriteLine("[Burst] input-selector 構成を取得できないためスキップします");
+                return;
+            }
+
+            Console.WriteLine($"[Burst] テスト映像/テスト音を {_config.StartupBurstMs}ms 継続します");
+            await Task.Delay(_config.StartupBurstMs);
+
+            GstNativeInterop.SetObject(vsel.Handle, "active-pad", capPad.Handle);
+            if (asel is not null && realAudioPad is not null)
+            {
+                GstNativeInterop.SetObject(asel.Handle, "active-pad", realAudioPad.Handle);
+            }
+            Console.WriteLine("[Burst] キャプチャ映像/実音声へ切り替えました");
+            // クライアントへ「テスト映像が終わった」ことを通知する(クライアントはそれまで video をミュートにする)
+            if (_controlChannelHandle != IntPtr.Zero && _isControlChannelOpen)
+            {
+                GstNativeInterop.DataChannelSendString(_controlChannelHandle, JsonSerializer.Serialize(new { type = "burstEnd" }));
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Burst] failed: {ex}");
+        }
+    }
+
     private void CreateControlDataChannel()
     {
         _controlChannelHandle = GstNativeInterop.CreateDataChannel(_webrtcHandle, "control");
@@ -277,6 +317,10 @@ internal sealed class WebRtcSession : IDisposable
             {
                 _isControlChannelOpen = true;
                 Console.WriteLine("[Input] Control data channel open");
+                if (_config.StartupBurstMs > 0 && _config.EnablePlayoutDelay)
+                {
+                    var burstTask = StartupBurstAsync();
+                }
             }
             catch (Exception ex) { Console.WriteLine($"[Input][FATAL in onControlChannelOpen] {ex}"); }
         };
@@ -786,6 +830,15 @@ internal sealed class WebRtcSession : IDisposable
             ? "rtph265pay name=vpay config-interval=-1 pt=96 aggregate-mode=zero-latency !"
             : "video/x-h264,profile=baseline ! rtph264pay name=vpay config-interval=-1 pt=96 aggregate-mode=zero-latency !";
 
+        // 接続直後の数百msだけ、動きのあるテスト映像(videotestsrc)に切り替える実験機能。
+        // input-selector でキャプチャ映像とテスト映像を切り替える。無効時は従来どおりの構成。
+        var burst = config.StartupBurstMs > 0 && config.EnablePlayoutDelay && !config.UseTestSource;
+        var videoHead = burst
+            // cache-buffers=true: 切り戻し時に直前のキャプチャフレームを再送し、静止画面でも
+            // テスト映像が残り続けないようにする
+            ? "input-selector name=vsel cache-buffers=true !"
+            : videoSource;
+
         var parts = new List<string>
         {
             $"webrtcbin name=sendrecv bundle-policy=max-bundle stun-server={config.StunServer}",
@@ -793,7 +846,7 @@ internal sealed class WebRtcSession : IDisposable
             // 映像: プライマリモニタ(または切り替え後の対象)をキャプチャしてエンコードし RTP 化
             // 各要素に名前を付け、エラー発生時に映像経路だけをまとめて NULL -> PLAYING で
             // 再初期化できるようにしている。
-            videoSource,
+            videoHead,
             "videoconvert name=vconv !",
             "videocrop name=vcrop !",
             "video/x-raw,format=I420 !",
@@ -812,21 +865,44 @@ internal sealed class WebRtcSession : IDisposable
 
         };
 
-        if (config.EnableAudio)
+        var audioTail = new[]
         {
-            parts.AddRange(new[]
-            {
+            "queue max-size-buffers=1 leaky=downstream !",
+            "opusenc bitrate=64000 !",
+            "rtpopuspay pt=97 !",
+            // 音声も同様に上限を100msに絞る。音声パケットは1つ落ちても一瞬のノイズで済むため leaky にする。
+            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 leaky=downstream ! sendrecv.",
+        };
+
+        if (burst)
+        {
+            // ---- 映像 ----
+            // 上のチェーン(vsel -> ... -> sendrecv.)に2つの入力を接続する。
+            // 先に接続した方が最初の active-pad になるため、テスト映像を先(sink_0)にして
+            // 「最初からテスト映像」で始める。キャプチャ映像は sink_1。
+            // テスト映像の解像度は、既定のキャプチャ対象(モニター0)に合わせる。
+            // (切り替え時にエンコーダの再ネゴシエーションを起こさないため)
+            var rect = ScreenGeometry.GetMonitorRect(0) ?? ScreenGeometry.PrimaryMonitorFallback;
+            var bw = rect.Width - rect.Width % 2;
+            var bh = rect.Height - rect.Height % 2;
+            parts.Add($"videotestsrc name=burstsrc is-live=true pattern=ball ! capsfilter name=burstcaps caps=\"video/x-raw,format=NV12,width={bw},height={bh},framerate={config.Framerate}/1\" ! vsel.");
+            parts.Add(videoSource.Replace("d3d11download !", "d3d11download name=capdl ! vsel."));
+
+            // ---- 音声 ---- (テスト音 → 実音声。どちらも同一フォーマットに揃えてから input-selector へ)
+            parts.Add("input-selector name=asel ! volume name=vol !");
+            parts.AddRange(audioTail);
+            parts.Add("audiotestsrc name=atestsrc is-live=true wave=sine volume=0.02 ! audioconvert ! audioresample ! capsfilter name=atestcaps caps=\"audio/x-raw,format=S16LE,rate=48000,channels=2\" ! asel.");
+            parts.Add(audioSource);
+            parts.Add("audioconvert ! audioresample ! capsfilter name=arealcaps caps=\"audio/x-raw,format=S16LE,rate=48000,channels=2\" ! asel.");
+        }
+        else
+        {
             // 音声: 既定の再生デバイスをループバックキャプチャして Opus でエンコードし RTP 化
-                // volume 要素でミュート/音量を制御できるようにする。
-                audioSource,
-                "audioconvert ! audioresample !",
-                "volume name=vol !",
-                "queue max-size-buffers=1 leaky=downstream !",
-                "opusenc bitrate=64000 !",
-                "rtpopuspay pt=97 !",
-                // 音声も同様に上限を100msに絞る。音声パケットは1つ落ちても一瞬のノイズで済むため leaky にする。
-                "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 leaky=downstream ! sendrecv.",
-            });
+            // volume 要素でミュート/音量を制御できるようにする。
+            parts.Add(audioSource);
+            parts.Add("audioconvert ! audioresample !");
+            parts.Add("volume name=vol !");
+            parts.AddRange(audioTail);
         }
 
         return string.Join(" ", parts);
@@ -1122,11 +1198,11 @@ internal sealed class HostConfig
     /// 切り分けテスト用パイプラインになる。</summary>
     public bool UseTestSource { get; set; } = false;
 
-    /// <summary>false の場合は音声パイプラインを構築しない(接続クエリ ?audio=0)。</summary>
-    public bool EnableAudio { get; set; } = true;
-
     /// <summary>true の場合、RTP の playout-delay 拡張(min=max=0)で受信側に低遅延再生を指示する(接続クエリ ?playout=0 で無効化)。</summary>
     public bool EnablePlayoutDelay { get; set; } = true;
+
+    /// <summary>接続直後にこのミリ秒だけ動きのあるテスト映像を流す実験機能(0で無効。接続クエリ ?burst=ms)。</summary>
+    public int StartupBurstMs { get; set; } = 0;
 
     /// <summary>キャプチャフレームレート(接続時にクエリパラメータ ?fps=60 で上書き可能)。</summary>
     public int Framerate { get; set; } = 30;

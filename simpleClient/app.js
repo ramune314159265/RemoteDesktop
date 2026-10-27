@@ -2,8 +2,8 @@ const wsUrlInput = document.getElementById("wsUrl");
 const fpsInput = document.getElementById("fpsInput");
 const codecSelect = document.getElementById("codecSelect");
 const inputSelect = document.getElementById("inputSelect");
-const audioCheck = document.getElementById("audioCheck");
 const playoutCheck = document.getElementById("playoutCheck");
+const burstInput = document.getElementById("burstInput");
 const connectBtn = document.getElementById("connectBtn");
 const disconnectBtn = document.getElementById("disconnectBtn");
 const statusEl = document.getElementById("status");
@@ -11,6 +11,9 @@ const videoEl = document.getElementById("remoteVideo");
 const logEl = document.getElementById("log");
 
 wsUrlInput.value = localStorage.getItem('ramune314159265.remotesimpleclient.lasturl') ?? `ws://${location.hostname}:8787/signaling`
+
+// 接続時テスト音声/映像が流れている間 true。終了通知(burstEnd)を受けるまで video をミュートにする。
+let burstPending = false;
 
 let ws = null;
 let pc = null;
@@ -122,7 +125,11 @@ function connect() {
   const fps = parseInt(fpsInput.value, 10) || 30;
   const codec = codecSelect.value;
   const separator = baseUrl.includes("?") ? "&" : "?";
-  const url = `${baseUrl}${separator}fps=${fps}&codec=${encodeURIComponent(codec)}&audio=${audioCheck.checked ? 1 : 0}&playout=${playoutCheck.checked ? 1 : 0}`;
+  const url = `${baseUrl}${separator}fps=${fps}&codec=${encodeURIComponent(codec)}&playout=${playoutCheck.checked ? 1 : 0}&burst=${parseInt(burstInput.value, 10) || 0}`;
+
+  // 接続時テスト映像(低遅延モードがオンのときのみ有効)が終わるまで、video をミュートにしておく
+  burstPending = playoutCheck.checked && (parseInt(burstInput.value, 10) || 0) > 0;
+  updateVideoMuted();
 
   setStatus("接続中...", "connecting");
   pc = createPeerConnection();
@@ -159,6 +166,7 @@ function connect() {
 }
 
 function cleanupPeer() {
+  burstPending = false;
   if (pc) {
     pc.close();
     pc = null;
@@ -486,7 +494,13 @@ applyBitrateBtn.addEventListener("click", () => {
 
 muteCheckbox.addEventListener("change", () => {
   sendControl({ type: "setMute", muted: muteCheckbox.checked });
+  updateVideoMuted();
 });
+
+// video の再生ミュート: テスト映像の間、またはミュートのチェックが入っている間はミュートにする
+function updateVideoMuted() {
+  videoEl.muted = burstPending || muteCheckbox.checked;
+}
 
 listMonitorsBtn.addEventListener("click", () => {
   sendControl({ type: "listMonitors" });
@@ -545,6 +559,10 @@ function handleControlChannelMessage(data) {
       monitorSelect.appendChild(opt);
     }
     log(`Monitor list received (${msg.monitors.length} monitors)`);
+  } else if (msg.type === "burstEnd") {
+    log("Test stream finished, switching to the real screen/audio");
+    burstPending = false;
+    updateVideoMuted();
   } else if (msg.type === "sourceError") {
     log("Source error:", msg.message);
     alert(msg.message);
@@ -690,20 +708,8 @@ setInterval(async () => {
   const videoDelay = averageJitterBufferDelayMs(cur.video, prevInbound.video);
   const audioDelay = averageJitterBufferDelayMs(cur.audio, prevInbound.audio);
 
-  // 受信側のデコード時間(1フレームあたり)。ここが大きければ受信端末のデコードが律速。
-  const decodedFrames = delta(cur.video, prevInbound.video, "framesDecoded");
-  const decodeMs = decodedFrames > 0
-    ? (delta(cur.video, prevInbound.video, "totalDecodeTime") / decodedFrames) * 1000
-    : null;
-
   if (videoDelay !== null) {
-    const fmt = (v) => (v === null || v === undefined ? "n/a" : `${Math.round(v)}ms`);
-    const perFrame = (key) => {
-      const n = delta(cur.video, prevInbound.video, "jitterBufferEmittedCount");
-      return cur.video[key] === undefined || n <= 0 ? null : (delta(cur.video, prevInbound.video, key) / n) * 1000;
-    };
-    const targetDelay = perFrame("jitterBufferTargetDelay");
-    const minDelay = perFrame("jitterBufferMinimumDelay");
+    const fmt = (v) => (v === null ? "n/a" : `${Math.round(v)}ms`);
     const detail =
       `video buffer=${fmt(videoDelay)}, audio buffer=${fmt(audioDelay)}, ` +
       `rtt=${rttMs === null ? "n/a" : Math.round(rttMs) + "ms"}, ` +
@@ -711,13 +717,7 @@ setInterval(async () => {
       `lost=${delta(cur.video, prevInbound.video, "packetsLost")}, ` +
       `nack=${delta(cur.video, prevInbound.video, "nackCount")}, ` +
       `pli=${delta(cur.video, prevInbound.video, "pliCount")}, ` +
-      `dropped=${delta(cur.video, prevInbound.video, "framesDropped")}, ` +
-      `recvFps=${(delta(cur.video, prevInbound.video, "framesReceived") / (STATS_INTERVAL_MS / 1000)).toFixed(1)}, ` +
-      `decode=${decodeMs === null ? "n/a" : decodeMs.toFixed(1) + "ms"}, ` +
-      `res=${cur.video.frameWidth ?? "?"}x${cur.video.frameHeight ?? "?"}, ` +
-      `jitter=${cur.video.jitter !== undefined ? Math.round(cur.video.jitter * 1000) + "ms" : "n/a"}, ` +
-      `target=${fmt(targetDelay)}, minDelay=${fmt(minDelay)}, ` +
-      `ua=${navigator.userAgent.includes("Chrome") ? "Chrome系" : navigator.userAgent.includes("Safari") ? "Safari" : "other"}`;
+      `dropped=${delta(cur.video, prevInbound.video, "framesDropped")}`;
 
     if (videoDelay > LAG_WARN_MS) {
       log(`[Stats] ラグ検知: ${detail}`);
