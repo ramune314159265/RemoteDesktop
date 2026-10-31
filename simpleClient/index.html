@@ -12,6 +12,7 @@
   <main>
     <div class="side">
       <button id="closeBtn">閉じる</button>
+      <button id="fullscreenBtn">全画面表示</button>
       <section class="controls">
         <label>
           シグナリングサーバ (ws://host:port/signaling)
@@ -44,7 +45,7 @@
       <section class="controls">
         <label>
           ビットレート (kbps)
-          <input type="number" id="bitrateInput" value="4000" min="500" max="20000" step="500" />
+          <input type="number" id="bitrateInput" value="6000" min="500" max="20000" step="500" />
         </label>
         <button id="applyBitrateBtn">適用</button>
 
@@ -55,13 +56,9 @@
       </section>
 
       <section class="controls">
-        <button id="listMonitorsBtn">モニター一覧取得</button>
-        <select id="monitorSelect" style="min-width: 240px"></select>
-        <button id="switchMonitorBtn">モニターに切り替え</button>
-
-        <button id="listWindowsBtn">ウィンドウ一覧取得</button>
-        <select id="windowSelect" style="min-width: 240px"></select>
-        <button id="switchWindowBtn">ウィンドウに切り替え</button>
+        <button id="listSourcesBtn">配信元一覧取得</button>
+        <select id="sourceSelect" style="min-width: 280px"></select>
+        <button id="switchSourceBtn">配信元に切り替え</button>
 
         <label>
           入力
@@ -73,6 +70,7 @@
         </label>
 
         <button id="forceFitBtn">解像度強制フィット</button>
+        <button id="screenshotBtn">スクリーンショット</button>
       </section>
 
       <section class="log-wrap">

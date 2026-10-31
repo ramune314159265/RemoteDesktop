@@ -61,6 +61,7 @@ function createPeerConnection() {
     controlChannel.onopen = () => {
       log("Control channel open");
       scheduleSendViewportSize();
+      sendControl({ type: "listSources" });
     };
     controlChannel.onclose = () => log("Control channel closed");
     controlChannel.onerror = (e) => log("Control channel error:", e.message ?? e);
@@ -125,7 +126,7 @@ function connect() {
   const fps = parseInt(fpsInput.value, 10) || 30;
   const codec = codecSelect.value;
   const separator = baseUrl.includes("?") ? "&" : "?";
-  const url = `${baseUrl}${separator}fps=${fps}&codec=${encodeURIComponent(codec)}&playout=${playoutCheck.checked ? 1 : 0}&burst=${parseInt(burstInput.value, 10) || 0}`;
+  const url = `${baseUrl}${separator}fps=${fps}&codec=${encodeURIComponent(codec)}&playout=${playoutCheck.checked ? 1 : 0}&bitrate=${parseInt(bitrateInput.value, 10) || 6000}&burst=${parseInt(burstInput.value, 10) || 0}`;
 
   // 接続時テスト映像(低遅延モードがオンのときのみ有効)が終わるまで、video をミュートにしておく
   burstPending = playoutCheck.checked && (parseInt(burstInput.value, 10) || 0) > 0;
@@ -478,12 +479,11 @@ const closeBtn = document.getElementById("closeBtn");
 const bitrateInput = document.getElementById("bitrateInput");
 const applyBitrateBtn = document.getElementById("applyBitrateBtn");
 const muteCheckbox = document.getElementById("muteCheckbox");
-const listMonitorsBtn = document.getElementById("listMonitorsBtn");
-const monitorSelect = document.getElementById("monitorSelect");
-const switchMonitorBtn = document.getElementById("switchMonitorBtn");
-const listWindowsBtn = document.getElementById("listWindowsBtn");
-const windowSelect = document.getElementById("windowSelect");
-const switchWindowBtn = document.getElementById("switchWindowBtn");
+const listSourcesBtn = document.getElementById("listSourcesBtn");
+const sourceSelect = document.getElementById("sourceSelect");
+const switchSourceBtn = document.getElementById("switchSourceBtn");
+const fullscreenBtn = document.getElementById("fullscreenBtn");
+const screenshotBtn = document.getElementById("screenshotBtn");
 const forceFitBtn = document.getElementById("forceFitBtn");
 
 applyBitrateBtn.addEventListener("click", () => {
@@ -502,28 +502,75 @@ function updateVideoMuted() {
   videoEl.muted = burstPending || muteCheckbox.checked;
 }
 
-listMonitorsBtn.addEventListener("click", () => {
-  sendControl({ type: "listMonitors" });
+listSourcesBtn.addEventListener("click", () => {
+  sendControl({ type: "listSources" });
 });
 
-switchMonitorBtn.addEventListener("click", () => {
-  const index = parseInt(monitorSelect.value, 10);
-  if (!Number.isFinite(index)) return;
-  log(`Switching to monitor ${index} (数秒フリーズします)`);
+// 選択肢の value: "monitor:<番号>" / "window:<ハンドル>" / "none"(映像なし=音声のみ)
+switchSourceBtn.addEventListener("click", () => {
+  const value = sourceSelect.value;
+  if (!value) return;
   lastSentViewportSize = null; // 別ソースへの切替なので直前値による抑制をリセットする
-  sendControl({ type: "switchSource", sourceMode: "monitor", monitorIndex: index });
+
+  if (value === "none") {
+    log("Switching to no-video (audio only)");
+    sendControl({ type: "switchSource", sourceMode: "none" });
+  } else if (value.startsWith("monitor:")) {
+    const index = parseInt(value.slice("monitor:".length), 10);
+    if (!Number.isFinite(index)) return;
+    log(`Switching to monitor ${index} (数秒フリーズします)`);
+    sendControl({ type: "switchSource", sourceMode: "monitor", monitorIndex: index });
+  } else if (value.startsWith("window:")) {
+    const handle = value.slice("window:".length);
+    log(`Switching to window handle ${handle} (数秒フリーズします)`);
+    sendControl({ type: "switchSource", sourceMode: "window", windowHandle: Number(handle) });
+  }
 });
 
-listWindowsBtn.addEventListener("click", () => {
-  sendControl({ type: "listWindows" });
+function addOptionGroup(label, items) {
+  const group = document.createElement("optgroup");
+  group.label = label;
+  for (const [value, text] of items) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = text;
+    group.appendChild(opt);
+  }
+  sourceSelect.appendChild(group);
+}
+
+// ---------------------------------------------------------------------------
+// 全画面表示 / スクリーンショット
+// ---------------------------------------------------------------------------
+
+function fullscreenElement() {
+  return document.fullscreenElement ?? document.webkitFullscreenElement ?? null;
+}
+
+fullscreenBtn.addEventListener("click", () => {
+  if (fullscreenElement()) {
+    (document.exitFullscreen ?? document.webkitExitFullscreen)?.call(document);
+    return;
+  }
+  const target = document.documentElement;
+  const request = target.requestFullscreen ?? target.webkitRequestFullscreen;
+  if (!request) {
+    log("このブラウザは全画面表示に対応していません");
+    return;
+  }
+  // 新旧どちらの実装でも Promise が返る/返らないに対応
+  Promise.resolve(request.call(target)).catch((err) => log("全画面表示に失敗:", err.message ?? err));
 });
 
-switchWindowBtn.addEventListener("click", () => {
-  const handle = windowSelect.value;
-  if (!handle) return;
-  log(`Switching to window handle ${handle} (数秒フリーズします)`);
-  lastSentViewportSize = null; // 別ソースへの切替なので直前値による抑制をリセットする
-  sendControl({ type: "switchSource", sourceMode: "window", windowHandle: Number(handle) });
+function updateFullscreenButton() {
+  fullscreenBtn.textContent = fullscreenElement() ? "全画面を終了" : "全画面表示";
+}
+document.addEventListener("fullscreenchange", updateFullscreenButton);
+document.addEventListener("webkitfullscreenchange", updateFullscreenButton);
+
+screenshotBtn.addEventListener("click", () => {
+  log("スクリーンショットを要求しました");
+  sendControl({ type: "screenshot" });
 });
 
 forceFitBtn.addEventListener("click", () => {
@@ -541,24 +588,29 @@ function handleControlChannelMessage(data) {
     return;
   }
 
-  if (msg.type === "windowList") {
-    windowSelect.innerHTML = "";
-    for (const w of msg.windows) {
-      const opt = document.createElement("option");
-      opt.value = w.handle;
-      opt.textContent = w.title;
-      windowSelect.appendChild(opt);
+  if (msg.type === "sourceList") {
+    sourceSelect.innerHTML = "";
+    addOptionGroup(
+      "モニター",
+      msg.monitors.map((m) => [
+        `monitor:${m.index}`,
+        `${m.name} (${m.width}x${m.height})${m.isPrimary ? " [プライマリ]" : ""}`,
+      ])
+    );
+    addOptionGroup(
+      "ウィンドウ",
+      msg.windows.map((w) => [`window:${w.handle}`, w.title])
+    );
+    addOptionGroup("その他", [["none", "映像なし(音声のみ)"]]);
+    if (msg.current) sourceSelect.value = msg.current;
+    log(`Source list received (${msg.monitors.length} monitors, ${msg.windows.length} windows)`);
+  } else if (msg.type === "screenshotResult") {
+    if (msg.ok) {
+      log(`スクリーンショットを保存しました: ${msg.message}`);
+    } else {
+      log(`スクリーンショットに失敗しました: ${msg.message}`);
+      alert(`スクリーンショットに失敗しました: ${msg.message}`);
     }
-    log(`Window list received (${msg.windows.length} windows)`);
-  } else if (msg.type === "monitorList") {
-    monitorSelect.innerHTML = "";
-    for (const m of msg.monitors) {
-      const opt = document.createElement("option");
-      opt.value = m.index;
-      opt.textContent = `${m.name} (${m.width}x${m.height})${m.isPrimary ? " [プライマリ]" : ""}`;
-      monitorSelect.appendChild(opt);
-    }
-    log(`Monitor list received (${msg.monitors.length} monitors)`);
   } else if (msg.type === "burstEnd") {
     log("Test stream finished, switching to the real screen/audio");
     burstPending = false;

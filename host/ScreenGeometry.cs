@@ -508,45 +508,71 @@ internal static class ScreenGeometry
     private const uint SWP_NOSIZE = 0x0001;
     private const uint SWP_FRAMECHANGED = 0x0020;
 
-    /// <summary>WS_OVERLAPPEDWINDOW のビットが現在立っているかどうか。</summary>
-    public static bool HasOverlappedWindowStyle(IntPtr hWnd) => (GetWindowLong(hWnd, GWL_STYLE) & WS_OVERLAPPEDWINDOW) != 0;
+    /// <summary>WS_OVERLAPPEDWINDOW のビットが現在ひとつでも立っているかどうか。</summary>
+    public static bool HasOverlappedWindowStyle(IntPtr hWnd) => GetOverlappedStyleBits(hWnd) != 0;
+
+    /// <summary>
+    /// 現在のスタイルのうち WS_OVERLAPPEDWINDOW に含まれるビット(タイトルバー・枠・システムメニュー・
+    /// 最小化/最大化ボタン等)だけを返す。配信開始前にこれを記録しておき、終了時にそのビットだけを
+    /// 戻すことで、元から一部のビットしか持たないウィンドウ(最大化ボタンの無いダイアログ等)に
+    /// 余計なボタンや枠を付けてしまわないようにする。
+    /// </summary>
+    public static int GetOverlappedStyleBits(IntPtr hWnd)
+        => IsWindow(hWnd) ? GetWindowLong(hWnd, GWL_STYLE) & WS_OVERLAPPEDWINDOW : 0;
 
     /// <summary>
     /// WS_OVERLAPPEDWINDOW を取り除く(既に無ければ何もしない)。
     /// 現在のスタイル値から該当ビットだけを外す(スナップショットの丸ごと上書きはしない)。
     /// スタイル変更を見た目に反映させるため SWP_FRAMECHANGED 付きで SetWindowPos を呼ぶ
     /// (MSDN 推奨の手順。位置・サイズ自体は変えない)。
+    /// 変更後にスタイルを読み直して実際に外れたかを確認し、外れていなければ(管理者権限の
+    /// ウィンドウへは UIPI により変更できない等) false を返してログに理由を出す。
     /// </summary>
     public static bool RemoveOverlappedWindowStyle(IntPtr hWnd)
     {
         if (!IsWindow(hWnd)) return false;
 
         var style = GetWindowLong(hWnd, GWL_STYLE);
-        if ((style & WS_OVERLAPPEDWINDOW) == 0) return false;
+        if ((style & WS_OVERLAPPEDWINDOW) == 0) return true; // 既に無い
 
         SetWindowLong(hWnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+        var err = Marshal.GetLastWin32Error();
         SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+        var after = GetWindowLong(hWnd, GWL_STYLE);
+        if ((after & WS_OVERLAPPEDWINDOW) != 0)
+        {
+            Console.WriteLine($"[Window] タイトルバー等の除去に失敗しました (Win32 error={err}。管理者権限で動作しているウィンドウには変更できません)");
+            return false;
+        }
         return true;
     }
 
     /// <summary>
-    /// WS_OVERLAPPEDWINDOW を付け直す(既にあれば何もしない)。
-    ///
-    /// 配信開始前のスタイル値をそのままスナップショットとして丸ごと上書き復元するのではなく、
-    /// 「その時点の現在のスタイル」に対して該当ビットだけを OR で付け足す方式にしている。
-    /// 配信中にアプリ自身が(タイトルバーと無関係な)別のスタイルビットを変更している
-    /// 可能性があり、丸ごと上書きするとそれらを意図せず巻き戻してしまう上、
-    /// 何らかの理由で上書きが反映されないケースがあったため、より安全な方式にした。
+    /// 記録しておいたスタイルビット(GetOverlappedStyleBits の値)を付け直す。
+    /// 「その時点の現在のスタイル」に対して該当ビットだけを OR で付け足す方式
+    /// (配信中にアプリ自身が別のビットを変更している可能性があるため、丸ごと上書きはしない)。
+    /// 変更後に読み直して反映を確認し、結果を返す。
     /// </summary>
-    public static bool AddOverlappedWindowStyle(IntPtr hWnd)
+    public static bool RestoreOverlappedStyleBits(IntPtr hWnd, int bits)
     {
         if (!IsWindow(hWnd)) return false;
+        bits &= WS_OVERLAPPEDWINDOW;
+        if (bits == 0) return true;
 
         var style = GetWindowLong(hWnd, GWL_STYLE);
-        if ((style & WS_OVERLAPPEDWINDOW) == WS_OVERLAPPEDWINDOW) return false;
+        if ((style & bits) == bits) return true; // 既に戻っている
 
-        SetWindowLong(hWnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowLong(hWnd, GWL_STYLE, style | bits);
+        var err = Marshal.GetLastWin32Error();
         SetWindowPos(hWnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+        var after = GetWindowLong(hWnd, GWL_STYLE);
+        if ((after & bits) != bits)
+        {
+            Console.WriteLine($"[Window] タイトルバー等の復元に失敗しました (Win32 error={err})");
+            return false;
+        }
         return true;
     }
 

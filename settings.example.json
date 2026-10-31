@@ -1,0 +1,13 @@
+{
+  "prefix": "http://+:8787/",
+  "wssPort": 8788,
+  "cert": "",
+  "certPassword": "",
+  "certKey": "",
+  "stun": "stun://stun.l.google.com:19302",
+  "testSource": false,
+  "fps": 60,
+  "codec": "h265",
+  "bitrate": 6000,
+  "windowMonitor": ""
+}

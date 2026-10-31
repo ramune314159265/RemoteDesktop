@@ -505,8 +505,16 @@ internal static class InputInjector
 
     // ---- 公開API ----------------------------------------------------------------
 
+    /// <summary>
+    /// false の間は、すべての入力(マウス/キーボード/タッチ)を無視する。
+    /// 配信元が「映像なし」(音声のみ)のとき、見えない画面を操作されないようにするために使う。
+    /// </summary>
+    public static volatile bool Enabled = true;
+
     public static void Handle(ControlMessage msg)
     {
+        if (!Enabled) return;
+
         try
         {
             switch (msg.Type)

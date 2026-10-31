@@ -8,6 +8,9 @@ namespace RemoteDesktopHost;
 
 internal static class Program
 {
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
     private static async Task<int> Main(string[] args)
     {
         // どこかで捕捉漏れの例外が起きた場合でも、無言で終了させず必ずログを残す。
@@ -30,33 +33,67 @@ internal static class Program
             e.SetObserved();
         };
 
+        // Per-Monitor DPI aware (V2) にする。未設定だと拡大率(例:125%)の異なるモニターで
+        // ウィンドウ/モニターの座標・サイズが論理ピクセルに仮想化され、キャプチャ解像度や
+        // マウス座標マッピングとずれる。他のウィンドウAPIを呼ぶ前に最初に設定する。
+        try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
+
+        // 設定の優先順位: 起動引数 > settings.json(実行ファイルと同じディレクトリ) > 既定値
         // 例: RemoteDesktopHost.exe --prefix http://+:8787/ --stun stun://stun.l.google.com:19302
-        //     --test-source --fps 60 --codec hevc
+        //     --test-source --fps 60 --codec hevc --bitrate 6000 --window-monitor "DELL U2720Q"
         //     wss: --wss-port 8788 [--cert cert.pfx --cert-password xxx]
-        var prefix = GetArg(args, "--prefix") ?? "http://+:8787/";
+        //     別の設定ファイル: --settings C:\path\to\settings.json
+        var settings = HostSettings.Load(GetArg(args, "--settings"));
+
+        var prefix = GetArg(args, "--prefix") ?? settings.Prefix ?? "http://+:8787/";
         // wss(TLS) 設定。--wss-port を指定すると ws と同時に wss も待ち受ける。
         //   --cert <pfx|pem> [--cert-password <pw>] [--cert-key <pem秘密鍵>]
         //   --cert 未指定なら自己署名証明書 (selfsigned.pfx) を自動生成して使う。
-        var wssPort = int.TryParse(GetArg(args, "--wss-port"), out var wssPortArg) ? wssPortArg : 0;
+        var wssPort = int.TryParse(GetArg(args, "--wss-port"), out var wssPortArg) ? wssPortArg : settings.WssPort ?? 0;
         var wssOptions = wssPort > 0
             ? new WssOptions
             {
                 Port = wssPort,
-                CertPath = GetArg(args, "--cert"),
-                CertPassword = GetArg(args, "--cert-password"),
-                KeyPath = GetArg(args, "--cert-key"),
+                CertPath = GetArg(args, "--cert") ?? settings.Cert,
+                CertPassword = GetArg(args, "--cert-password") ?? settings.CertPassword,
+                KeyPath = GetArg(args, "--cert-key") ?? settings.CertKey,
             }
             : null;
-        var stun = GetArg(args, "--stun") ?? "stun://stun.l.google.com:19302";
-        var useTestSource = Array.IndexOf(args, "--test-source") >= 0;
-        var defaultFps = int.TryParse(GetArg(args, "--fps"), out var fpsArg) ? fpsArg : 30;
-        var defaultCodec = string.Equals(GetArg(args, "--codec"), "hevc", StringComparison.OrdinalIgnoreCase)
+        var stun = GetArg(args, "--stun") ?? settings.Stun ?? "stun://stun.l.google.com:19302";
+        var useTestSource = Array.IndexOf(args, "--test-source") >= 0 || settings.TestSource == true;
+        var defaultFps = int.TryParse(GetArg(args, "--fps"), out var fpsArg) ? fpsArg : settings.Fps ?? 30;
+        var defaultCodec = string.Equals(GetArg(args, "--codec") ?? settings.Codec, "hevc", StringComparison.OrdinalIgnoreCase)
             ? VideoCodec.Hevc
             : VideoCodec.H264;
-        var windowMonitorIndex = int.TryParse(GetArg(args, "--window-monitor"), out var wmArg) ? wmArg : 1;
+        var defaultBitrate = uint.TryParse(GetArg(args, "--bitrate"), out var brArg) ? brArg : settings.Bitrate ?? 6000;
+
+        // ウィンドウ配信用モニター: 番号 または モニター名
+        var windowMonitorSpec = (GetArg(args, "--window-monitor") ?? settings.WindowMonitor?.ToString() ?? "1").Trim();
+        var windowMonitorIndex = 1;
+        string? windowMonitorName = null;
+        if (int.TryParse(windowMonitorSpec, out var wmIndex)) windowMonitorIndex = wmIndex;
+        else if (windowMonitorSpec.Length > 0) windowMonitorName = windowMonitorSpec;
+
+        // 前回の異常終了(クラッシュ・強制終了等)でタイトルバーを外したまま/位置を動かしたままに
+        // なっているウィンドウがあれば、最初に元へ戻す。
+        WindowStyleRecovery.RecoverFromPreviousRun();
 
         Application.Init(); // Gst.Init 相当 (GstSharpBundle)
         Console.WriteLine($"[Gst] Version: {GstNativeInterop.GetVersionString()}");
+
+        // 設定(--window-monitor / settings.json の windowMonitor)でモニター名を指定する際の参考用。
+        try
+        {
+            Console.WriteLine("[Config] 検出されたモニター (windowMonitor には番号か名前を指定できます):");
+            foreach (var m in ScreenGeometry.GetMonitorInfos())
+            {
+                Console.WriteLine($"    {m.Index}: {m.Name} ({m.Width}x{m.Height}){(m.IsPrimary ? " [プライマリ]" : "")}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Config] モニター一覧の取得に失敗: {ex.Message}");
+        }
 
         // タッチ注入 (CreateSyntheticPointerDevice) は、ここ(メインスレッド)ではなく
         // 実際に InjectSyntheticPointerInput を呼ぶスレッド(DataChannel受信コールバックが
@@ -78,6 +115,8 @@ internal static class Program
             Framerate = defaultFps,
             Codec = defaultCodec,
             WindowTargetMonitorIndex = windowMonitorIndex,
+            WindowTargetMonitorName = windowMonitorName,
+            BitrateKbps = defaultBitrate,
         };
         if (useTestSource)
         {
@@ -127,8 +166,13 @@ internal static class Program
                     ? VideoCodec.Hevc
                     : config.Codec,
                 WindowTargetMonitorIndex = config.WindowTargetMonitorIndex,
+                WindowTargetMonitorName = config.WindowTargetMonitorName,
+                // 接続クエリ ?bitrate=kbps で接続ごとに上書き可能(500〜100000 にクランプ)
+                BitrateKbps = client.QueryParams.TryGetValue("bitrate", out var brStr) && uint.TryParse(brStr, out var br)
+                    ? Math.Clamp(br, 500u, 100000u)
+                    : config.BitrateKbps,
             };
-            Console.WriteLine($"[Config] fps={perConnectionConfig.Framerate}, codec={perConnectionConfig.Codec}");
+            Console.WriteLine($"[Config] fps={perConnectionConfig.Framerate}, codec={perConnectionConfig.Codec}, bitrate={perConnectionConfig.BitrateKbps}kbps");
 
             var session = new WebRtcSession(client, perConnectionConfig);
             lock (sessionLock) { currentSession = session; }
@@ -160,10 +204,26 @@ internal static class Program
             }
         };
 
+        // 終了時(Ctrl+C / コンソールを閉じる / 通常終了)に、配信中のセッションを必ず破棄する。
+        // これをしないと、配信対象にしたウィンドウのタイトルバーや位置が元に戻らないまま終了してしまう。
+        void DisposeActiveSession()
+        {
+            WebRtcSession? s;
+            lock (sessionLock)
+            {
+                s = currentSession;
+                currentSession = null;
+            }
+            try { s?.Dispose(); }
+            catch (Exception ex) { Console.WriteLine($"[Session] Dispose on shutdown failed: {ex.Message}"); }
+        }
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => DisposeActiveSession();
+
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
             Console.WriteLine("Shutting down...");
+            DisposeActiveSession();
             server.Stop();
             mainLoop.Quit();
             Environment.Exit(0);

@@ -34,6 +34,16 @@ internal sealed class WebRtcSession : IDisposable
     private IntPtr _videoEncoderHandle;
     private IntPtr _volumeHandle;
     private IntPtr _captureSourceHandle;
+
+    // 映像の入力切り替え(input-selector): キャプチャ映像 / 黒画面(「映像なし」用)
+    private IntPtr _videoSelectorHandle;
+    private Pad? _captureSelPad;
+    private Pad? _blackSelPad;
+    private bool _burstActive;      // 接続時テスト映像(実験機能)を流している間
+    private bool _videoDisabled;      // 「映像なし」(音声のみ)中
+    private volatile int _captureWidth;   // 直近のキャプチャ解像度(切り替え時に解像度が同じか判定する)
+    private volatile int _captureHeight;
+    private int _currentMonitorIndex; // 現在モニター配信中の番号(スクリーンショットの撮影範囲に使う)
     private Element? _captureSourceElement;
     private Element? _videoQueue1Element;
     private Element? _videoEncoderElement;
@@ -54,7 +64,7 @@ internal sealed class WebRtcSession : IDisposable
     /// bottom を調整するために参照する。</summary>
     private int _videoCropTopPixels;
 
-    private uint _currentBitrateKbps = 4000;
+    private uint _currentBitrateKbps;
 
     // 直近に「切り替えを試みた」ソース設定。エラー発生時、これより前に有効だった
     // 設定へロールバックするのではなく、常に安全なプライマリモニタへ戻す簡易実装。
@@ -77,7 +87,14 @@ internal sealed class WebRtcSession : IDisposable
     private (int Width, int Height)? _lastRequestedWindowSize; // それを実現するために実際にリクエストした「ウィンドウ全体」のサイズ
 
     // --- タイトルバー等(WS_OVERLAPPEDWINDOW)の着脱 ---
-    private bool? _originalHadOverlappedStyle; // 配信開始前にタイトルバー等があったか(終了時にその状態へ戻す)
+    // 配信のために位置・スタイルを変更したウィンドウと、変更前のタイトルバー等のスタイルビット。
+    // _currentWindowHandle(配信が確定した後で設定される)とは別に、「変更した時点」で記録する。
+    // (切り替えの途中で失敗した場合でも、変更済みのウィンドウを必ず元に戻せるようにするため)
+    private IntPtr? _trackedWindowHandle;
+    private int _originalStyleBits;
+    private bool _stripSucceeded;
+    private readonly object _windowLock = new(); // ウィンドウ状態の変更・復元を直列化する
+    private bool _windowStateDisposed;
     private int _styleStripAttempts;
     private const int MaxStyleStripAttempts = 2;
 
@@ -85,6 +102,7 @@ internal sealed class WebRtcSession : IDisposable
     {
         _client = client;
         _config = config;
+        _currentBitrateKbps = config.BitrateKbps;
         _client.MessageReceived += OnSignalingMessage;
     }
 
@@ -113,6 +131,12 @@ internal sealed class WebRtcSession : IDisposable
         _videoCropElement = _pipeline.GetByName("vcrop");
         _videoConvert2Element = _pipeline.GetByName("vconv2");
         _videoCropHandle = _videoCropElement?.Handle ?? IntPtr.Zero;
+
+        _videoSelectorHandle = _pipeline.GetByName("vsel")?.Handle ?? IntPtr.Zero;
+        _captureSelPad = _pipeline.GetByName("capdl")?.GetStaticPad("src")?.Peer;
+        _blackSelPad = _pipeline.GetByName("blackcaps")?.GetStaticPad("src")?.Peer;
+
+        _burstActive = _config.StartupBurstMs > 0 && _config.EnablePlayoutDelay && !_config.UseTestSource;
 
         // videoconvert -> vcrop の間(vcropのsinkパッド)の caps 変更を "notify::caps"
         // シグナル(GObjectの標準的なプロパティ変更通知)で監視し、
@@ -191,13 +215,35 @@ internal sealed class WebRtcSession : IDisposable
     {
         try
         {
+            // 切り替え/復元と同時に走らないよう直列化する(ロック待ちになる場合は今回は見送る)
+            if (!Monitor.TryEnter(_windowLock)) return;
+            try
+            {
+                if (_windowStateDisposed) return;
+                OnResizeWatchTickLocked();
+            }
+            finally
+            {
+                Monitor.Exit(_windowLock);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Config][FATAL in OnResizeWatchTick] {ex}");
+        }
+    }
+
+    private void OnResizeWatchTickLocked()
+    {
+        try
+        {
             if (_currentWindowHandle is not { } hwnd) return;
             if (!ScreenGeometry.IsWindow(hwnd)) return; // ウィンドウが閉じられた等。エラー処理は別途 SwitchSource/RecoverVideoBranch 側で行う。
 
             // タイトルバーを剥がした後、何らかの理由で復活していないか確認する。
             // (アプリが自前で再度スタイルを設定し直す、テーマ変更等で起こり得る)
             // 連続して復活し続ける場合は無限ループを避けるため一定回数で諦める。
-            if (_originalHadOverlappedStyle == true && ScreenGeometry.HasOverlappedWindowStyle(hwnd))
+            if (_stripSucceeded && ScreenGeometry.HasOverlappedWindowStyle(hwnd))
             {
                 if (_styleStripAttempts < MaxStyleStripAttempts)
                 {
@@ -277,13 +323,18 @@ internal sealed class WebRtcSession : IDisposable
             if (vsel is null || capPad is null)
             {
                 Console.WriteLine("[Burst] input-selector 構成を取得できないためスキップします");
+                _burstActive = false;
                 return;
             }
 
             Console.WriteLine($"[Burst] テスト映像/テスト音を {_config.StartupBurstMs}ms 継続します");
             await Task.Delay(_config.StartupBurstMs);
+            _burstActive = false;
 
-            GstNativeInterop.SetObject(vsel.Handle, "active-pad", capPad.Handle);
+            if (!_videoDisabled)
+            {
+                GstNativeInterop.SetObject(vsel.Handle, "active-pad", capPad.Handle);
+            }
             if (asel is not null && realAudioPad is not null)
             {
                 GstNativeInterop.SetObject(asel.Handle, "active-pad", realAudioPad.Handle);
@@ -373,12 +424,13 @@ internal sealed class WebRtcSession : IDisposable
                     SwitchSource(msg);
                     break;
 
-                case "listWindows":
-                    SendWindowList();
+                case "listSources":
+                    SendSourceList();
                     break;
 
-                case "listMonitors":
-                    SendMonitorList();
+                case "screenshot":
+                    // GDI での撮影と PNG 保存は時間がかかるため、DataChannel の受信スレッドを塞がない
+                    var screenshotTask = Task.Run(TakeScreenshot);
                     break;
 
                 case "setViewportSize":
@@ -453,6 +505,15 @@ internal sealed class WebRtcSession : IDisposable
     /// </summary>
     private void SwitchSource(ControlMessage msg)
     {
+        lock (_windowLock)
+        {
+            if (_windowStateDisposed) return;
+            SwitchSourceLocked(msg);
+        }
+    }
+
+    private void SwitchSourceLocked(ControlMessage msg)
+    {
         if (_captureSourceElement is null || _captureSourceHandle == IntPtr.Zero)
         {
             Console.WriteLine("[Config] switchSource: capture source not ready");
@@ -480,22 +541,29 @@ internal sealed class WebRtcSession : IDisposable
                 RestoreOriginalWindowRectIfNeeded();
                 _originalWindowRect = ScreenGeometry.GetWindowRectSafe(hwnd);
                 _lastRequestedWindowSize = null;
+
+                // 変更に入る前に「元の状態」を記録する(途中で失敗しても復元できるようにするため、
+                // 位置の移動・スタイル変更より前に追跡対象として登録する)。
+                _trackedWindowHandle = hwnd;
+                _originalStyleBits = ScreenGeometry.GetOverlappedStyleBits(hwnd);
+                _stripSucceeded = false;
+                WindowStyleRecovery.Save(hwnd, _originalStyleBits, _originalWindowRect);
+
                 MoveWindowToTargetMonitor(hwnd);
 
                 // タイトルバー等(WS_OVERLAPPEDWINDOW)を取り除く。これにより
                 // GetWindowRect(見た目)とクライアント領域(キャプチャ範囲)の差が
                 // 無くなり、タイトルバー分のクロップ/ズレが原理的に発生しなくなる。
-                // 「配信開始前に持っていたかどうか」だけを記録し、終了時はその状態に
-                // 戻す(元から無いウィンドウなら何もしない)。
-                _originalHadOverlappedStyle = ScreenGeometry.HasOverlappedWindowStyle(hwnd);
+                // 配信開始前に持っていたビットだけを記録し、終了時はそのビットだけを戻す。
                 _styleStripAttempts = 0;
-                if (_originalHadOverlappedStyle == true)
+                if (_originalStyleBits != 0)
                 {
-                    ScreenGeometry.RemoveOverlappedWindowStyle(hwnd);
+                    _stripSucceeded = ScreenGeometry.RemoveOverlappedWindowStyle(hwnd);
                 }
             }
 
-            ApplySourceSwitch(() =>
+            var winRect = ScreenGeometry.GetWindowRectSafe(hwnd);
+            SwitchCaptureViaBlack(winRect?.Width ?? 0, winRect?.Height ?? 0, () =>
             {
                 GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", msg.WindowHandle.Value);
             });
@@ -524,18 +592,41 @@ internal sealed class WebRtcSession : IDisposable
 
             RestoreOriginalWindowRectIfNeeded();
 
-            ApplySourceSwitch(() =>
+            var targetMonitorRect = ScreenGeometry.GetMonitorRect(msg.MonitorIndex.Value);
+            SwitchCaptureViaBlack(targetMonitorRect?.Width ?? 0, targetMonitorRect?.Height ?? 0, () =>
             {
                 // window-handle を 0 に戻してウィンドウキャプチャモードを解除する。
                 GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", 0);
                 GstNativeInterop.SetInt(_captureSourceHandle, "monitor-index", msg.MonitorIndex.Value);
             });
+            _currentMonitorIndex = msg.MonitorIndex.Value;
 
             var rect = ScreenGeometry.GetMonitorRect(msg.MonitorIndex.Value);
             InputInjector.SetCaptureRegion(rect ?? ScreenGeometry.PrimaryMonitorFallback);
             _currentWindowHandle = null;
             _lastKnownWindowRect = null;
             ResetWindowChromeCrop();
+        }
+        else if (msg.SourceMode == "none")
+        {
+            // 「映像なし」: 映像は黒画面(<video> 要素は残す)、音声は配信し続ける。
+            // 見えない画面を操作されないよう、入力操作は無効にする。
+            RestoreOriginalWindowRectIfNeeded();
+            _currentWindowHandle = null;
+            _lastKnownWindowRect = null;
+            ResetWindowChromeCrop();
+
+            _videoDisabled = true;
+            InputInjector.Enabled = false;
+            if (_videoSelectorHandle != IntPtr.Zero && _blackSelPad is not null)
+            {
+                GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _blackSelPad.Handle);
+            }
+
+            // キャプチャ自体も止めて負荷を下げる(次の切り替えで ApplySourceSwitch が再開する)
+            _captureSourceElement.SetLockedState(true);
+            _captureSourceElement.SetState(State.Ready);
+            Console.WriteLine("[Config] 映像なし(音声のみ)に切り替えました");
         }
         else
         {
@@ -548,13 +639,51 @@ internal sealed class WebRtcSession : IDisposable
     /// 指定モニター(固定、DPI100%・十分な大きさを想定)へウィンドウを移動する。
     /// この時点ではサイズは変えず、位置だけ移す(サイズはクライアントからのサイズ指定を待つ)。
     /// </summary>
+    private bool _monitorNameWarned;
+
+    /// <summary>
+    /// ウィンドウ配信先モニターの番号を求める。モニター名が指定されていれば名前で解決する
+    /// (接続・切断でモニター構成が変わっても名前なら追従できるよう、毎回解決する)。
+    /// </summary>
+    private int ResolveWindowTargetMonitorIndex()
+    {
+        var spec = _config.WindowTargetMonitorName?.Trim();
+        if (string.IsNullOrEmpty(spec)) return _config.WindowTargetMonitorIndex;
+
+        // "名前#2" -> 名前に一致する2番目
+        var nth = 1;
+        var hash = spec.LastIndexOf('#');
+        if (hash > 0 && int.TryParse(spec[(hash + 1)..], out var n) && n >= 1)
+        {
+            nth = n;
+            spec = spec[..hash].Trim();
+        }
+
+        var infos = ScreenGeometry.GetMonitorInfos();
+        var matches = infos.Where(m => string.Equals(m.Name, spec, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (matches.Count == 0)
+        {
+            matches = infos.Where(m => m.Name.Contains(spec, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+
+        if (matches.Count >= nth) return matches[nth - 1].Index;
+
+        if (!_monitorNameWarned)
+        {
+            _monitorNameWarned = true;
+            Console.WriteLine($"[Config] ウィンドウ配信先モニター \"{_config.WindowTargetMonitorName}\" が見つかりません。" +
+                              $"モニター番号 {_config.WindowTargetMonitorIndex} を使います。");
+        }
+        return _config.WindowTargetMonitorIndex;
+    }
+
     private void MoveWindowToTargetMonitor(IntPtr hwnd)
     {
-        var monitorRect = ScreenGeometry.GetMonitorRect(_config.WindowTargetMonitorIndex) ?? ScreenGeometry.PrimaryMonitorFallback;
+        var monitorRect = ScreenGeometry.GetMonitorRect(ResolveWindowTargetMonitorIndex()) ?? ScreenGeometry.PrimaryMonitorFallback;
         var currentRect = ScreenGeometry.GetWindowRectSafe(hwnd);
         if (currentRect is null) return;
 
-        Console.WriteLine($"[Config] Moving window to target monitor {_config.WindowTargetMonitorIndex} at ({monitorRect.X},{monitorRect.Y})");
+        Console.WriteLine($"[Config] Moving window to target monitor {ResolveWindowTargetMonitorIndex()} at ({monitorRect.X},{monitorRect.Y})");
         ScreenGeometry.MoveResizeWindow(hwnd, monitorRect.X + 20, monitorRect.Y + 20, currentRect.Value.Width, currentRect.Value.Height);
     }
 
@@ -586,7 +715,16 @@ internal sealed class WebRtcSession : IDisposable
     /// </summary>
     private void ApplyRequestedClientSize(IntPtr hwnd, int clientWidth, int clientHeight)
     {
-        var monitorRect = ScreenGeometry.GetMonitorRect(_config.WindowTargetMonitorIndex) ?? ScreenGeometry.PrimaryMonitorFallback;
+        lock (_windowLock)
+        {
+            if (_windowStateDisposed) return;
+            ApplyRequestedClientSizeLocked(hwnd, clientWidth, clientHeight);
+        }
+    }
+
+    private void ApplyRequestedClientSizeLocked(IntPtr hwnd, int clientWidth, int clientHeight)
+    {
+        var monitorRect = ScreenGeometry.GetMonitorRect(ResolveWindowTargetMonitorIndex()) ?? ScreenGeometry.PrimaryMonitorFallback;
 
         var windowWidth = clientWidth;
         var windowHeight = clientHeight + _videoCropTopPixels;
@@ -620,25 +758,64 @@ internal sealed class WebRtcSession : IDisposable
     /// <summary>配信終了時、追跡していたウィンドウを元の位置・サイズ・スタイルへ戻す。</summary>
     private void RestoreOriginalWindowRectIfNeeded()
     {
-        if (_currentWindowHandle is { } hwnd && ScreenGeometry.IsWindow(hwnd))
+        lock (_windowLock)
         {
-            if (_originalHadOverlappedStyle == true)
+            // 配信が確定する前(切り替え途中の失敗)でも元に戻せるよう、
+            // _currentWindowHandle ではなく「変更した時点で記録した」ハンドルを使う。
+            if (_trackedWindowHandle is { } hwnd)
             {
-                Console.WriteLine("[Config] Restoring window title bar");
-                ScreenGeometry.AddOverlappedWindowStyle(hwnd);
+                if (ScreenGeometry.IsWindow(hwnd))
+                {
+                    if (_originalStyleBits != 0)
+                    {
+                        Console.WriteLine("[Config] Restoring window title bar");
+                        ScreenGeometry.RestoreOverlappedStyleBits(hwnd, _originalStyleBits);
+                    }
+
+                    if (_originalWindowRect is { } orig)
+                    {
+                        Console.WriteLine("[Config] Restoring window to its original position/size");
+                        ScreenGeometry.MoveResizeWindow(hwnd, orig.X, orig.Y, orig.Width, orig.Height);
+                    }
+                }
+
+                WindowStyleRecovery.Remove(hwnd);
             }
 
-            if (_originalWindowRect is { } orig)
-            {
-                Console.WriteLine("[Config] Restoring window to its original position/size");
-                ScreenGeometry.MoveResizeWindow(hwnd, orig.X, orig.Y, orig.Width, orig.Height);
-            }
+            _trackedWindowHandle = null;
+            _originalStyleBits = 0;
+            _stripSucceeded = false;
+            _originalWindowRect = null;
+            _styleStripAttempts = 0;
+            _lastRequestedWindowSize = null;
+        }
+    }
+
+    /// <summary>
+    /// キャプチャ元の切り替え。切り替え前後で解像度が同じ(例: 同じ解像度のモニター同士)だと
+    /// エンコーダ/下流が「流れが途切れた」ことに気付けず映像が固まることがあったため、
+    /// 一旦黒画面(解像度が異なる)を経由して、エンコーダを確実に再ネゴシエーションさせる。
+    /// (解像度が変わる切り替え=ウィンドウ経由では固まらないことが確認できているため、同じ経路にする)
+    /// </summary>
+    private void SwitchCaptureViaBlack(int targetWidth, int targetHeight, Action applyProperties)
+    {
+        // 解像度が変わる切り替えはエンコーダが自然に再初期化されるため黒画面は不要。
+        // 現在の解像度が不明、または切り替え先と同じ(または判定不能)の場合のみ挟む。
+        var sameResolution = targetWidth <= 0 || targetHeight <= 0
+            || (_captureWidth == targetWidth && _captureHeight == targetHeight);
+
+        var bridged = false;
+        if (sameResolution && !_videoDisabled && !_burstActive && _videoSelectorHandle != IntPtr.Zero && _blackSelPad is not null)
+        {
+            GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _blackSelPad.Handle);
+            bridged = true;
+            Thread.Sleep(200); // 黒画面を数フレーム流し、エンコーダに解像度変更を認識させる
         }
 
-        _originalWindowRect = null;
-        _originalHadOverlappedStyle = null;
-        _styleStripAttempts = 0;
-        _lastRequestedWindowSize = null;
+        ApplySourceSwitch(applyProperties);
+
+        if (bridged) _videoDisabled = true; // EnableCaptureInput にキャプチャへ戻させる
+        EnableCaptureInput();
     }
 
     /// <summary>capturesrc だけを READY に落とし、プロパティ変更後 PLAYING へ戻す共通処理。</summary>
@@ -720,6 +897,8 @@ internal sealed class WebRtcSession : IDisposable
             }
 
             InputInjector.SetCaptureRegion(ScreenGeometry.GetMonitorRect(0) ?? ScreenGeometry.PrimaryMonitorFallback);
+            _currentMonitorIndex = 0;
+            EnableCaptureInput();
             RestoreOriginalWindowRectIfNeeded();
             _currentWindowHandle = null;
             _lastKnownWindowRect = null;
@@ -787,25 +966,74 @@ internal sealed class WebRtcSession : IDisposable
         return newVenc;
     }
 
-    private void SendWindowList()
-    {
-        if (_controlChannelHandle == IntPtr.Zero || !_isControlChannelOpen) return;
-
-        var windows = WindowEnumerator.ListVisibleWindows();
-        var json = JsonSerializer.Serialize(new { type = "windowList", windows });
-        GstNativeInterop.DataChannelSendString(_controlChannelHandle, json);
-        Console.WriteLine($"[Config] Sent window list ({windows.Count} windows)");
-    }
-
-    private void SendMonitorList()
+    /// <summary>
+    /// 配信元として選べるもの(モニター / ウィンドウ)を1つのメッセージにまとめてクライアントへ送る。
+    /// current は現在の配信元("monitor:N" / "window:HANDLE" / "none")で、クライアントの選択状態の復元に使う。
+    /// </summary>
+    private void SendSourceList()
     {
         if (_controlChannelHandle == IntPtr.Zero || !_isControlChannelOpen) return;
 
         var monitors = ScreenGeometry.GetMonitorInfos();
-        var json = JsonSerializer.Serialize(new { type = "monitorList", monitors });
+        var windows = WindowEnumerator.ListVisibleWindows();
+        var current = _videoDisabled
+            ? "none"
+            : _currentWindowHandle is { } h ? $"window:{h.ToInt64()}" : $"monitor:{_currentMonitorIndex}";
+
+        var json = JsonSerializer.Serialize(new { type = "sourceList", monitors, windows, current });
         GstNativeInterop.DataChannelSendString(_controlChannelHandle, json);
-        Console.WriteLine($"[Config] Sent monitor list ({monitors.Count} monitors)");
+        Console.WriteLine($"[Config] Sent source list ({monitors.Count} monitors, {windows.Count} windows)");
     }
+
+    /// <summary>配信範囲(モニター全体 / 配信中ウィンドウのクライアント領域)を撮影して保存し、結果をクライアントへ返す。</summary>
+    private void TakeScreenshot()
+    {
+        try
+        {
+            bool ok;
+            string result;
+            if (_videoDisabled)
+            {
+                ok = false;
+                result = "「映像なし」の間は撮影できません。";
+            }
+            else
+            {
+                IntPtr? hwnd = _currentWindowHandle is { } h && ScreenGeometry.IsWindow(h) ? h : null;
+                var monitorRect = ScreenGeometry.GetMonitorRect(_currentMonitorIndex) ?? ScreenGeometry.PrimaryMonitorFallback;
+                ok = ScreenshotCapturer.TryCapture(hwnd, monitorRect, out result);
+            }
+
+            Console.WriteLine(ok ? $"[Screenshot] 保存しました: {result}" : $"[Screenshot] 失敗: {result}");
+            if (_controlChannelHandle != IntPtr.Zero && _isControlChannelOpen)
+            {
+                var json = JsonSerializer.Serialize(new { type = "screenshotResult", ok, message = result });
+                GstNativeInterop.DataChannelSendString(_controlChannelHandle, json);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Screenshot][FATAL] {ex}");
+        }
+    }
+
+    /// <summary>映像入力をキャプチャ映像へ切り替え、入力操作も有効に戻す(「映像なし」からの復帰用)。</summary>
+    private void EnableCaptureInput()
+    {
+        var wasDisabled = _videoDisabled;
+        _videoDisabled = false;
+        InputInjector.Enabled = true;
+
+        // 既にキャプチャ映像が選ばれている(モニター→モニター等)場合は、セレクタに触れない。
+        // 「映像なし」からの復帰時と、接続時テスト映像中のみ切り替える。
+        if (!wasDisabled && !_burstActive) return;
+
+        if (_videoSelectorHandle != IntPtr.Zero && _captureSelPad is not null)
+        {
+            GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _captureSelPad.Handle);
+        }
+    }
+
 
     private static string BuildPipelineDescription(HostConfig config)
     {
@@ -821,7 +1049,7 @@ internal sealed class WebRtcSession : IDisposable
 
         var audioSource = config.UseTestSource
             ? "audiotestsrc name=audiosrc is-live=true wave=sine !"
-            : "wasapisrc name=audiosrc loopback=true low-latency=true do-timestamp=true !";
+            : "wasapisrc name=audiosrc loopback=true low-latency=true !";
 
         var videoCapsAndPay = config.Codec == VideoCodec.Hevc
             // H.265/HEVC: libx264/nvh264enc よりも効率的だが、WebRTCでのブラウザ対応は
@@ -833,9 +1061,12 @@ internal sealed class WebRtcSession : IDisposable
         // 接続直後の数百msだけ、動きのあるテスト映像(videotestsrc)に切り替える実験機能。
         // input-selector でキャプチャ映像とテスト映像を切り替える。無効時は従来どおりの構成。
         var burst = config.StartupBurstMs > 0 && config.EnablePlayoutDelay && !config.UseTestSource;
-        var videoHead = burst
-            // cache-buffers=true: 切り戻し時に直前のキャプチャフレームを再送し、静止画面でも
-            // テスト映像が残り続けないようにする
+        // 映像の入力は input-selector 経由にし、キャプチャ映像 / 黒画面(「映像なし」用) /
+        // (実験機能)接続時テスト映像を切り替えられるようにする。
+        // cache-buffers=true: 切り戻し時に直前のフレームを再送し、静止画面でも
+        // 切り替え前の映像が残り続けないようにする。
+        var useSelector = !config.UseTestSource;
+        var videoHead = useSelector
             ? "input-selector name=vsel cache-buffers=true !"
             : videoSource;
 
@@ -850,9 +1081,11 @@ internal sealed class WebRtcSession : IDisposable
             "videoconvert name=vconv !",
             "videocrop name=vcrop !",
             "video/x-raw,format=I420 !",
-            "queue name=vqueue1 max-size-buffers=1 leaky=downstream !",
+            // 1枚だと、キャプチャが一瞬2枚続けて届いた(WGC/ディスプレイ周期とのゆらぎ)だけで
+            // 1枚捨ててしまい、周期的な小さなコマ落ちの原因になる。2枚まで許容する。
+            "queue name=vqueue1 max-size-buffers=2 leaky=downstream !",
             "videoconvert name=vconv2 !",
-            BuildVideoEncoderDescription(config, 4000) + " !",
+            BuildVideoEncoderDescription(config, config.BitrateKbps) + " !",
             videoCapsAndPay,
             // queue のデフォルトは最大1秒分(max-size-time=1s)まで溜め込めるため、下流(webrtcbin)が
             // 一時的に詰まった際に最大約1秒の遅延がそのまま残る恐れがある。上限を100msに絞る。
@@ -867,27 +1100,35 @@ internal sealed class WebRtcSession : IDisposable
 
         var audioTail = new[]
         {
-            "queue max-size-buffers=1 leaky=downstream !",
+            // 1バッファ(10ms)だけだと、ほんの一瞬エンコーダ側が遅れただけで音声が欠け、
+            // 受信側で欠落補間/加速再生(ピッチ変化に聞こえる)が起きやすい。200msまで吸収する。
+            "queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream !",
             "opusenc bitrate=64000 !",
             "rtpopuspay pt=97 !",
             // 音声も同様に上限を100msに絞る。音声パケットは1つ落ちても一瞬のノイズで済むため leaky にする。
             "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 leaky=downstream ! sendrecv.",
         };
 
-        if (burst)
+        if (useSelector)
         {
-            // ---- 映像 ----
-            // 上のチェーン(vsel -> ... -> sendrecv.)に2つの入力を接続する。
-            // 先に接続した方が最初の active-pad になるため、テスト映像を先(sink_0)にして
-            // 「最初からテスト映像」で始める。キャプチャ映像は sink_1。
-            // テスト映像の解像度は、既定のキャプチャ対象(モニター0)に合わせる。
-            // (切り替え時にエンコーダの再ネゴシエーションを起こさないため)
-            var rect = ScreenGeometry.GetMonitorRect(0) ?? ScreenGeometry.PrimaryMonitorFallback;
-            var bw = rect.Width - rect.Width % 2;
-            var bh = rect.Height - rect.Height % 2;
-            parts.Add($"videotestsrc name=burstsrc is-live=true pattern=ball ! capsfilter name=burstcaps caps=\"video/x-raw,format=NV12,width={bw},height={bh},framerate={config.Framerate}/1\" ! vsel.");
+            // 上のチェーン(vsel -> ... -> sendrecv.)へ入力を接続する。先に接続したものが最初の active-pad になる。
+            if (burst)
+            {
+                // テスト映像を先(最初の入力)にして「最初からテスト映像」で始める。
+                var rect = ScreenGeometry.GetMonitorRect(0) ?? ScreenGeometry.PrimaryMonitorFallback;
+                var bw = rect.Width - rect.Width % 2;
+                var bh = rect.Height - rect.Height % 2;
+                parts.Add($"videotestsrc name=burstsrc is-live=true pattern=ball ! capsfilter name=burstcaps caps=\"video/x-raw,format=NV12,width={bw},height={bh},framerate={config.Framerate}/1\" ! vsel.");
+            }
+
             parts.Add(videoSource.Replace("d3d11download !", "d3d11download name=capdl ! vsel."));
 
+            // 「映像なし」用の黒画面(低解像度・低負荷)。
+            parts.Add($"videotestsrc name=blacksrc is-live=true pattern=black ! capsfilter name=blackcaps caps=\"video/x-raw,format=NV12,width=640,height=360,framerate={Math.Max(config.Framerate, 1)}/1\" ! vsel.");
+        }
+
+        if (burst)
+        {
             // ---- 音声 ---- (テスト音 → 実音声。どちらも同一フォーマットに揃えてから input-selector へ)
             parts.Add("input-selector name=asel ! volume name=vol !");
             parts.AddRange(audioTail);
@@ -1042,6 +1283,8 @@ internal sealed class WebRtcSession : IDisposable
         {
             if (GstNativeInterop.TryGetPadCurrentSize(padHandle, out var width, out var height))
             {
+                _captureWidth = width;
+                _captureHeight = height;
                 var cropRight = width % 2 != 0 ? 1 : 0;
 
                 // top を既にタイトルバー除去用にクロップしている場合、その分を差し引いた
@@ -1177,9 +1420,15 @@ internal sealed class WebRtcSession : IDisposable
     {
         // 引き継ぎ(takeover)と Disconnected の両方から呼ばれうるので、二重実行を防ぐ
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        RestoreOriginalWindowRectIfNeeded();
-        _playoutDelay?.Detach();
+        // 先にタイマーを止め、以降ウィンドウ状態を触らせないようにしてから元に戻す
+        // (戻した直後にタイマーがタイトルバーを再度外す、といった競合を防ぐ)。
         _resizeWatchTimer?.Dispose();
+        lock (_windowLock)
+        {
+            _windowStateDisposed = true;
+            RestoreOriginalWindowRectIfNeeded();
+        }
+        _playoutDelay?.Detach();
         _client.MessageReceived -= OnSignalingMessage;
         if (_pipeline is not null)
         {
@@ -1201,6 +1450,9 @@ internal sealed class HostConfig
     /// <summary>true の場合、RTP の playout-delay 拡張(min=max=0)で受信側に低遅延再生を指示する(接続クエリ ?playout=0 で無効化)。</summary>
     public bool EnablePlayoutDelay { get; set; } = true;
 
+    /// <summary>映像の初期ビットレート(kbps)。接続クエリ ?bitrate=kbps で上書き可能。</summary>
+    public uint BitrateKbps { get; set; } = 6000;
+
     /// <summary>接続直後にこのミリ秒だけ動きのあるテスト映像を流す実験機能(0で無効。接続クエリ ?burst=ms)。</summary>
     public int StartupBurstMs { get; set; } = 0;
 
@@ -1215,6 +1467,12 @@ internal sealed class HostConfig
     /// DPI拡大率100%・十分なサイズがあるモニターを想定している。
     /// </summary>
     public int WindowTargetMonitorIndex { get; set; } = 1;
+
+    /// <summary>
+    /// ウィンドウ配信先モニターの名前(部分一致、"名前#2" で同名の2番目)。指定した場合は
+    /// WindowTargetMonitorIndex より優先し、見つからなければ WindowTargetMonitorIndex を使う。
+    /// </summary>
+    public string? WindowTargetMonitorName { get; set; }
 }
 
 internal enum VideoCodec
