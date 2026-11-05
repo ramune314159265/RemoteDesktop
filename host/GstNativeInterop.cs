@@ -32,8 +32,6 @@ internal static class GstNativeInterop
         Rollback = 4,
     }
 
-    // ---- delegate 型 (シグナルコールバック) ----------------------------------
-
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void NegotiationNeededCallback(IntPtr webrtcbin, IntPtr userData);
 
@@ -42,8 +40,6 @@ internal static class GstNativeInterop
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void PromiseChangeFunc(IntPtr promise, IntPtr userData);
-
-    // ---- g_signal_connect_data / g_signal_emit_by_name ----------------------
 
     [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_signal_connect_data")]
     private static extern ulong g_signal_connect_data(
@@ -58,8 +54,6 @@ internal static class GstNativeInterop
         => g_signal_connect_data(webrtcbin, "on-ice-candidate",
             Marshal.GetFunctionPointerForDelegate(cb), IntPtr.Zero, IntPtr.Zero, 0);
 
-    // create-offer / create-answer / set-local-description / set-remote-description は
-    // いずれも (instance, name, gpointer, gpointer) の形で emit できる。
     [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_signal_emit_by_name")]
     private static extern void g_signal_emit_by_name_2ptr(IntPtr instance, string detailedSignal, IntPtr arg1, IntPtr arg2);
 
@@ -69,9 +63,6 @@ internal static class GstNativeInterop
     public static void EmitCreateOffer(IntPtr webrtcbin, IntPtr promise)
         => g_signal_emit_by_name_2ptr(webrtcbin, "create-offer", IntPtr.Zero, promise);
 
-    public static void EmitCreateAnswer(IntPtr webrtcbin, IntPtr promise)
-        => g_signal_emit_by_name_2ptr(webrtcbin, "create-answer", IntPtr.Zero, promise);
-
     public static void EmitSetLocalDescription(IntPtr webrtcbin, IntPtr desc, IntPtr promise)
         => g_signal_emit_by_name_2ptr(webrtcbin, "set-local-description", desc, promise);
 
@@ -80,13 +71,6 @@ internal static class GstNativeInterop
 
     public static void EmitAddIceCandidate(IntPtr webrtcbin, uint mlineIndex, string candidate)
         => g_signal_emit_by_name_ice(webrtcbin, "add-ice-candidate", mlineIndex, candidate);
-
-    // ---- DataChannel ------------------------------------------------------------
-    //
-    // マウス/キーボード/タッチなどの制御入力を送るための WebRTC DataChannel。
-    // webrtcbin の "create-data-channel" アクションシグナルは
-    // GstWebRTCDataChannel* (GObject) を戻り値として返すため、
-    // g_signal_emit_by_name の可変引数の最後に「戻り値の格納先」を渡す形で呼び出す。
 
     [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_signal_emit_by_name")]
     private static extern void g_signal_emit_by_name_create_channel(
@@ -119,12 +103,6 @@ internal static class GstNativeInterop
     public static void DataChannelSendString(IntPtr channel, string data)
         => g_signal_emit_by_name_send_string(channel, "send-string", data);
 
-    // ---- g_object_set (プロパティの動的変更: ビットレート/ミュート/キャプチャ元切り替え等) ----
-    //
-    // g_object_set も可変引数のCの関数だが、直前の g_signal_emit_by_name と同じ考え方で、
-    // 「特定の1プロパティを設定する」呼び出し1つ1つに対応する、型を固定した
-    // P/Invoke 宣言を個別に用意する。
-
     [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_object_set")]
     private static extern void g_object_set_uint(IntPtr obj, string propertyName, uint value, IntPtr terminator);
 
@@ -133,9 +111,6 @@ internal static class GstNativeInterop
 
     [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_object_set")]
     private static extern void g_object_set_bool(IntPtr obj, string propertyName, int value, IntPtr terminator);
-
-    [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_object_set")]
-    private static extern void g_object_set_double(IntPtr obj, string propertyName, double value, IntPtr terminator);
 
     [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_object_set")]
     private static extern void g_object_set_uint64(IntPtr obj, string propertyName, ulong value, IntPtr terminator);
@@ -149,26 +124,8 @@ internal static class GstNativeInterop
     public static void SetBool(IntPtr obj, string propertyName, bool value)
         => g_object_set_bool(obj, propertyName, value ? 1 : 0, IntPtr.Zero);
 
-    public static void SetDouble(IntPtr obj, string propertyName, double value)
-        => g_object_set_double(obj, propertyName, value, IntPtr.Zero);
-
     public static void SetUInt64(IntPtr obj, string propertyName, ulong value)
         => g_object_set_uint64(obj, propertyName, value, IntPtr.Zero);
-
-    // ---- Pad の caps 変更通知 (notify::caps) で動的に偶数サイズへ丸める ------------------
-    //
-    // x264enc は奇数の width/height を受け付けず初期化に失敗する。
-    // ウィンドウキャプチャは任意のサイズ(奇数を含む)になり得るため、
-    // videocrop の手前(上流側)のパッドで "notify::caps" シグナル(GObjectの標準的な
-    // プロパティ変更通知)を監視し、caps が変わるたびに videocrop の right/bottom
-    // プロパティを動的に設定して偶数サイズに丸める。
-    //
-    // 以前は GstPadProbe で DOWNSTREAM イベントを直接監視し、イベント種別を
-    // GstEventType の数値で判定せずに gst_event_parse_caps を呼んでいたが、
-    // CAPS 以外のイベント(SEGMENT等)に対して呼ぶと不正メモリアクセスで
-    // クラッシュすることが実機で判明した。GstEventType の正確な数値を
-    // 確実に判定する安全な方法がなかったため、より安全な notify::caps
-    // シグナル(caps が実際に変わった時にだけ、確実に発火する)に変更した。
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate void NotifyCallback(IntPtr gobject, IntPtr pspec, IntPtr userData);
@@ -212,8 +169,6 @@ internal static class GstNativeInterop
         }
     }
 
-    // ---- GstPromise -----------------------------------------------------------
-
     [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr gst_promise_new();
 
@@ -222,9 +177,6 @@ internal static class GstNativeInterop
 
     [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
     public static extern void gst_promise_interrupt(IntPtr promise);
-
-    [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
-    public static extern int gst_promise_wait(IntPtr promise);
 
     [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
     public static extern void gst_promise_unref(IntPtr promise);
@@ -238,8 +190,6 @@ internal static class GstNativeInterop
         => gst_promise_new_with_change_func(Marshal.GetFunctionPointerForDelegate(cb), IntPtr.Zero, IntPtr.Zero);
 
     public static IntPtr PromiseGetReply(IntPtr promise) => gst_promise_get_reply(promise);
-
-    // ---- GstStructure から boxed 値 (GstWebRTCSessionDescription*) を取り出す ----
 
     [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr gst_structure_get_value(IntPtr structure, string fieldName);
@@ -262,13 +212,11 @@ internal static class GstNativeInterop
         return g_value_dup_boxed(valuePtr);
     }
 
-    // ---- GstWebRTCSessionDescription --------------------------------------------
-
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeWebRTCSessionDescription
     {
         public int Type;
-        public IntPtr Sdp; // GstSDPMessage*
+        public IntPtr Sdp;
     }
 
     [DllImport(GstWebRtc, CallingConvention = CallingConvention.Cdecl)]
@@ -286,8 +234,6 @@ internal static class GstNativeInterop
         var native = Marshal.PtrToStructure<NativeWebRTCSessionDescription>(descPtr);
         return SdpMessageAsText(native.Sdp);
     }
-
-    // ---- GstSDPMessage ------------------------------------------------------------
 
     [DllImport(GstSdp, CallingConvention = CallingConvention.Cdecl)]
     private static extern int gst_sdp_message_new(out IntPtr msg);
@@ -319,9 +265,6 @@ internal static class GstNativeInterop
         return msg;
     }
 
-    // ---- gst_version (GstSharpBundle の Version.String() が壊れているように見えるため、
-    //      確実な情報取得のためネイティブ関数を直接使う) --------------------------------
-
     [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
     private static extern void gst_version(out uint major, out uint minor, out uint micro, out uint nano);
 
@@ -331,31 +274,10 @@ internal static class GstNativeInterop
         return nano == 0 ? $"{major}.{minor}.{micro}" : $"{major}.{minor}.{micro} (nano {nano})";
     }
 
-    // ---- ポインタ型プロパティ / caps 文字列の設定 --------------------------------------
-
     [DllImport(GLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "g_object_set")]
     private static extern void g_object_set_ptr(IntPtr obj, string propertyName, IntPtr value, IntPtr terminator);
-
-    [DllImport(GstCore, CallingConvention = CallingConvention.Cdecl)]
-    private static extern IntPtr gst_caps_from_string(string str);
 
     /// <summary>GObject のポインタ(オブジェクト)型プロパティを設定する(例: input-selector の active-pad)。</summary>
     public static void SetObject(IntPtr obj, string propertyName, IntPtr value)
         => g_object_set_ptr(obj, propertyName, value, IntPtr.Zero);
-
-    /// <summary>capsfilter 等の "caps" プロパティを文字列から設定する。</summary>
-    public static bool SetCapsFromString(IntPtr element, string caps)
-    {
-        var c = gst_caps_from_string(caps);
-        if (c == IntPtr.Zero) return false;
-        try
-        {
-            g_object_set_ptr(element, "caps", c, IntPtr.Zero);
-            return true;
-        }
-        finally
-        {
-            gst_caps_unref(c);
-        }
-    }
 }

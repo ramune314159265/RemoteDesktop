@@ -19,8 +19,6 @@ internal sealed class PlayoutDelayExtension
 {
     public const string Uri = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay";
 
-    // ---- SDP 操作 ------------------------------------------------------------------
-
     /// <summary>
     /// オファー SDP の映像 m セクションに playout-delay の extmap を追加する。
     /// 追加した ID を返す。映像セクションが見つからない/空き ID が無い場合は null(SDP は無変更)。
@@ -29,7 +27,6 @@ internal sealed class PlayoutDelayExtension
     {
         extId = 0;
         var lines = new List<string>(sdp.Replace("\r\n", "\n").Split('\n'));
-        // 末尾の空要素を除く
         while (lines.Count > 0 && lines[^1].Length == 0) lines.RemoveAt(lines.Count - 1);
 
         var used = new HashSet<int>();
@@ -44,7 +41,6 @@ internal sealed class PlayoutDelayExtension
         var videoEnd = lines.FindIndex(videoStart + 1, l => l.StartsWith("m=", StringComparison.Ordinal));
         if (videoEnd < 0) videoEnd = lines.Count;
 
-        // 既に同じ拡張があればそのまま使う
         for (var i = videoStart; i < videoEnd; i++)
         {
             var m = Regex.Match(lines[i], @"^a=extmap:(\d+)\S*\s+" + Regex.Escape(Uri));
@@ -55,7 +51,6 @@ internal sealed class PlayoutDelayExtension
             }
         }
 
-        // one-byte ヘッダー拡張で使える ID は 1〜14
         var id = 0;
         for (var c = 1; c <= 14; c++)
         {
@@ -87,17 +82,14 @@ internal sealed class PlayoutDelayExtension
         return extId == 0 ? sdp : string.Join("\r\n", lines);
     }
 
-    // ---- buffer probe --------------------------------------------------------------
-
     private const string GstCore = "gstreamer-1.0-0.dll";
     private const string GstRtp = "gstrtp-1.0-0.dll";
 
     private const uint GST_PAD_PROBE_TYPE_BUFFER = 1 << 4;
     private const uint GST_PAD_PROBE_TYPE_BUFFER_LIST = 1 << 5;
     private const int GST_PAD_PROBE_OK = 1;
-    private const int GST_MAP_READWRITE = 3; // GST_MAP_READ | GST_MAP_WRITE
+    private const int GST_MAP_READWRITE = 3;
 
-    // GstRTPBuffer は GstMapInfo(約104B) x4 を含む(合計約528B)。余裕を持って確保する。
     private const int RtpBufferStructSize = 1024;
 
     private delegate int PadProbeCallback(IntPtr pad, IntPtr info, IntPtr userData);
@@ -132,15 +124,12 @@ internal sealed class PlayoutDelayExtension
     [DllImport(GstRtp, CallingConvention = CallingConvention.Cdecl)]
     private static extern int gst_rtp_buffer_add_extension_onebyte_header(IntPtr rtp, byte id, byte[] data, uint size);
 
-    // GstPadProbeInfo: guint type @0, gulong id, gpointer data ...
-    // Windows(LLP64)では gulong が 32bit のため id は @4〜7、data は @8 になる
-    // (Linux/LP64 なら data @16)。本プロジェクトは win-x64 固定。
     private const int InfoTypeOffset = 0;
     private const int InfoDataOffset = 8;
 
     private readonly PadProbeCallback _probeCallback;
     private readonly IntPtr _rtpStruct = Marshal.AllocHGlobal(RtpBufferStructSize);
-    private static readonly byte[] ExtPayload = { 0, 0, 0 }; // min=0, max=0 (単位 10ms, 各12bit)
+    private static readonly byte[] ExtPayload = { 0, 0, 0 };
 
     private IntPtr _pad;
     private uint _probeId;
@@ -148,7 +137,6 @@ internal sealed class PlayoutDelayExtension
     private long _packetsWritten;
     private long _failures;
     private bool _loggedFirstSuccess;
-
 
     public PlayoutDelayExtension()
     {
@@ -158,8 +146,8 @@ internal sealed class PlayoutDelayExtension
     /// <summary>payloader(rtph264pay 等)の src パッドへ probe を付ける。</summary>
     public void Attach(IntPtr payloaderElement, int extId)
     {
-        if (_pad != IntPtr.Zero) return; // 二重 Attach 防止
-        _extId = extId; // 0 の場合は診断カウントのみ(拡張は書かない)
+        if (_pad != IntPtr.Zero) return;
+        _extId = extId;
         var pad = gst_element_get_static_pad(payloaderElement, "src");
         if (pad == IntPtr.Zero)
         {
@@ -167,13 +155,13 @@ internal sealed class PlayoutDelayExtension
             return;
         }
         _probeId = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST, _probeCallback, IntPtr.Zero, IntPtr.Zero);
-        _pad = pad; // 参照は Detach まで保持
+        _pad = pad;
         Console.WriteLine($"[PlayoutDelay] RTP ヘッダー拡張の書き込みを開始 (extmap id={extId})");
     }
 
     public void Detach()
     {
-        _extId = 0; // 以降のコールバックは何もしない
+        _extId = 0;
         if (_pad != IntPtr.Zero)
         {
             try { gst_pad_remove_probe(_pad, _probeId); } catch { }
@@ -182,7 +170,6 @@ internal sealed class PlayoutDelayExtension
         }
     }
 
-    // GStreamer のストリーミングスレッドから呼ばれる。例外は絶対に外へ出さない。
     private int OnProbe(IntPtr pad, IntPtr info, IntPtr userData)
     {
         try
@@ -223,7 +210,6 @@ internal sealed class PlayoutDelayExtension
 
     private void AddExtension(IntPtr buffer, int extId)
     {
-        // 構造体はマップ関数が初期化するが、念のためゼロクリアしておく
         for (var o = 0; o < RtpBufferStructSize; o += 8) Marshal.WriteInt64(_rtpStruct, o, 0);
 
         if (gst_rtp_buffer_map(buffer, GST_MAP_READWRITE, _rtpStruct) == 0)

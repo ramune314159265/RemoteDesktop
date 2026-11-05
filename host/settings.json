@@ -1,0 +1,16 @@
+{
+  // すべて省略可能。起動引数を指定した項目は、起動引数が優先されます。
+  // "prefix": "http://+:8787/",
+  // "wssPort": 8788,
+  // "cert": "C:\\certs\\host.pfx",
+  // "certPassword": "",
+  // "certKey": "",
+  // "stun": "stun://stun.l.google.com:19302",
+  // "testSource": false,
+  "fps": 60,
+  "codec": "h264",
+  "bitrate": 6000
+  // ウィンドウ配信時に移動するモニター。番号(0始まり)またはモニター名(部分一致)。
+  // 同名が複数ある場合は "名前#2" のように指定します。
+  // ,"windowMonitor": "DELL U2720Q"
+}

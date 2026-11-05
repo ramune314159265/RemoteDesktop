@@ -92,8 +92,6 @@ internal static class ScreenGeometry
 
     public static int GetMonitorCount() => GetMonitorRects().Count;
 
-    // ---- モニターの名称取得 (GetMonitorInfo + EnumDisplayDevices) ----------------------
-
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct MONITORINFOEX
     {
@@ -127,24 +125,6 @@ internal static class ScreenGeometry
     private static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
 
     private const uint MONITORINFOF_PRIMARY = 0x00000001;
-
-    // ---- モニターの正確な製品名取得 (DisplayConfig API) --------------------------------
-    //
-    // EnumDisplayDevices の DeviceString は、モニタ側の ICM/INF が無い環境では
-    // 「Generic PnP Monitor」のような汎用名になることが多い。Windows の「設定」アプリが
-    // 表示しているような実際の製品名(EDID由来のフレンドリ名)を取得するには、代わりに
-    // QueryDisplayConfig / DisplayConfigGetDeviceInfo (DISPLAYCONFIG_TARGET_DEVICE_NAME)
-    // を使う必要がある。
-    //
-    // 手順:
-    //   1. QueryDisplayConfig で現在アクティブな各パス(GPU出力=ソース -> モニタ=ターゲット)を列挙する
-    //   2. 各パスのソース情報から GDI デバイス名 (例: "\\.\DISPLAY1") を取得し、
-    //      EnumDisplayMonitors/GetMonitorInfo で得た szDevice と突き合わせる
-    //   3. 一致したパスのターゲット情報 (adapterId + id) を使って、
-    //      DISPLAYCONFIG_TARGET_DEVICE_NAME から EDID 由来のフレンドリ名を取得する
-    //
-    // 取得できない(仮想ディスプレイ、リモートデスクトップのセッション等)場合は、
-    // 呼び出し側で従来の EnumDisplayDevices ベースの名前にフォールバックする。
 
     [StructLayout(LayoutKind.Sequential)]
     private struct LUID
@@ -180,8 +160,6 @@ internal static class ScreenGeometry
         public uint Scaling;
         public DISPLAYCONFIG_RATIONAL RefreshRate;
         public uint ScanLineOrdering;
-        // ネイティブ側は BOOL。.NET の bool を素朴に使うと既定で VARIANT_BOOL (2byte) として
-        // マーシャリングされ構造体全体のサイズがズレるため、明示的に int (4byte) で受ける。
         public int TargetAvailable;
         public uint StatusFlags;
     }
@@ -194,9 +172,6 @@ internal static class ScreenGeometry
         public uint Flags;
     }
 
-    // ネイティブの DISPLAYCONFIG_MODE_INFO は共用体を含む 64 バイト固定長の構造体。
-    // 中身(モード情報)は使わず、QueryDisplayConfig に渡す配列の要素サイズを
-    // 合わせるためだけに用意する。
     [StructLayout(LayoutKind.Explicit, Size = 64)]
     private struct DISPLAYCONFIG_MODE_INFO_PLACEHOLDER
     {
@@ -240,9 +215,6 @@ internal static class ScreenGeometry
     private const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
     private const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
 
-    // DISPLAYCONFIG_TARGET_DEVICE_NAME_FLAGS.friendlyNameFromEdid ビット。
-    // これが立っていない場合、monitorFriendlyDeviceName は信頼できない
-    // (空文字や内部的なプレースホルダになっていることがある)。
     private const uint DISPLAYCONFIG_TARGET_FLAG_FRIENDLY_NAME_FROM_EDID = 0x1;
 
     [DllImport("user32.dll")]
@@ -288,7 +260,6 @@ internal static class ScreenGeometry
                 paths = new DISPLAYCONFIG_PATH_INFO[pathCount];
                 modes = new DISPLAYCONFIG_MODE_INFO_PLACEHOLDER[modeCount];
                 err = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, ref pathCount, paths, ref modeCount, modes, IntPtr.Zero);
-                // 2回の呼び出しの間にディスプレイ構成が変わった場合、バッファが足りなくなることがあるためリトライする。
             } while (err == ERROR_INSUFFICIENT_BUFFER);
 
             if (err != ERROR_SUCCESS) return result;
@@ -395,8 +366,6 @@ internal static class ScreenGeometry
 
         EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, Callback, IntPtr.Zero);
 
-        // GDIデバイス名 (\\.\DISPLAY1 等) -> (アダプタLUID, ターゲットID) のマップ。
-        // 一度だけまとめて取得しておき、モニターごとの突き合わせに使う。
         var gdiNameToTarget = GetGdiDeviceNameToTargetMap();
 
         var result = new List<MonitorInfo>();
@@ -426,7 +395,6 @@ internal static class ScreenGeometry
                 }
                 else
                 {
-                    // フォールバック: 従来の EnumDisplayDevices ベースの名前解決。
                     var dd = new DISPLAY_DEVICE { cb = Marshal.SizeOf<DISPLAY_DEVICE>() };
                     if (EnumDisplayDevices(mi.szDevice, 0, ref dd, 0) && !string.IsNullOrWhiteSpace(dd.DeviceString))
                     {
@@ -470,7 +438,6 @@ internal static class ScreenGeometry
             return new Rect(dwmRect.Left, dwmRect.Top, dwmRect.Right - dwmRect.Left, dwmRect.Bottom - dwmRect.Top);
         }
 
-        // DWM が使えない環境向けのフォールバック。
         if (!GetWindowRect(hWnd, out var r)) return null;
         return new Rect(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
     }
@@ -483,18 +450,6 @@ internal static class ScreenGeometry
         if (!IsWindow(hWnd)) return false;
         return SetWindowPos(hWnd, IntPtr.Zero, x, y, Math.Max(1, width), Math.Max(1, height), SWP_NOZORDER | SWP_NOACTIVATE);
     }
-
-    // ---- ウィンドウスタイル (タイトルバー等の着脱) ------------------------------------
-    //
-    // WS_OVERLAPPEDWINDOW (タイトルバー・システムメニュー・サイズ変更枠・最小化/最大化
-    // ボタン一式) を取り除くと、GetWindowRect(見た目の範囲)とクライアント領域
-    // (実際にキャプチャされる範囲)の差が無くなり、タイトルバー分のクロップ計算や
-    // それに伴うズレが原理的に不要になる。
-    //
-    // GetWindowLong/SetWindowLong は正式名称に A/W サフィックスが必要だが、
-    // .NET の P/Invoke は既定で見つからない場合に自動的に "A" サフィックス付きの
-    // エクスポート (SetWindowLongA 等、64bit Windows でも実在する) を試すため、
-    // このままの宣言で動作する。
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
@@ -533,7 +488,7 @@ internal static class ScreenGeometry
         if (!IsWindow(hWnd)) return false;
 
         var style = GetWindowLong(hWnd, GWL_STYLE);
-        if ((style & WS_OVERLAPPEDWINDOW) == 0) return true; // 既に無い
+        if ((style & WS_OVERLAPPEDWINDOW) == 0) return true;
 
         SetWindowLong(hWnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
         var err = Marshal.GetLastWin32Error();
@@ -561,7 +516,7 @@ internal static class ScreenGeometry
         if (bits == 0) return true;
 
         var style = GetWindowLong(hWnd, GWL_STYLE);
-        if ((style & bits) == bits) return true; // 既に戻っている
+        if ((style & bits) == bits) return true;
 
         SetWindowLong(hWnd, GWL_STYLE, style | bits);
         var err = Marshal.GetLastWin32Error();

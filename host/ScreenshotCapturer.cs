@@ -14,8 +14,6 @@ namespace RemoteDesktopHost;
 /// </summary>
 internal static class ScreenshotCapturer
 {
-    // ---- Win32 -----------------------------------------------------------------
-
     [StructLayout(LayoutKind.Sequential)]
     private struct BITMAPINFOHEADER
     {
@@ -36,7 +34,7 @@ internal static class ScreenshotCapturer
     private struct BITMAPINFO
     {
         public BITMAPINFOHEADER bmiHeader;
-        public uint bmiColors; // 32bpp では未使用だが構造体の体裁として確保
+        public uint bmiColors;
     }
 
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd);
@@ -63,8 +61,6 @@ internal static class ScreenshotCapturer
     private const uint PW_RENDERFULLCONTENT = 0x2;
     private static readonly Guid FolderIdScreenshots = new("b7bede81-df94-4682-a7d8-57a52620b86f");
     private static readonly Guid FolderIdPictures = new("33E28130-4E1E-4676-835A-98395C3BC3BB");
-
-    // ---- 公開API ---------------------------------------------------------------
 
     /// <summary>
     /// monitorRect を撮影して保存する。hwnd が指定された場合は、そのウィンドウのクライアント領域だけを
@@ -106,7 +102,6 @@ internal static class ScreenshotCapturer
             Directory.CreateDirectory(dir);
             var fileName = $"スクリーンショット {DateTime.Now:yyyy-MM-dd HHmmss}.png";
             var path = Path.Combine(dir, fileName);
-            // 同じ秒に2枚撮った場合は上書きしない
             for (var n = 2; File.Exists(path); n++)
             {
                 path = Path.Combine(dir, $"スクリーンショット {DateTime.Now:yyyy-MM-dd HHmmss} ({n}).png");
@@ -122,8 +117,6 @@ internal static class ScreenshotCapturer
             return false;
         }
     }
-
-    // ---- 取得 ------------------------------------------------------------------
 
     private static byte[]? CaptureScreenRect(int x, int y, int width, int height)
     {
@@ -162,10 +155,10 @@ internal static class ScreenshotCapturer
             {
                 biSize = Marshal.SizeOf<BITMAPINFOHEADER>(),
                 biWidth = width,
-                biHeight = -height, // 負 = 上から下の並び
+                biHeight = -height,
                 biPlanes = 1,
                 biBitCount = 32,
-                biCompression = 0, // BI_RGB
+                biCompression = 0,
             },
         };
 
@@ -194,8 +187,6 @@ internal static class ScreenshotCapturer
         }
     }
 
-    // ---- 保存先 ----------------------------------------------------------------
-
     /// <summary>Windows 標準のスクリーンショットフォルダ。取得できなければ Pictures\Screenshots。</summary>
     private static string GetScreenshotsFolder()
     {
@@ -221,11 +212,8 @@ internal static class ScreenshotCapturer
         }
     }
 
-    // ---- PNG エンコード(8bit RGB, zlib) ---------------------------------------
-
     private static void WritePng(string path, byte[] bgra, int width, int height)
     {
-        // 各行の先頭にフィルタ種別(0=None)を付けた RGB 画素列
         var stride = width * 3;
         var raw = new byte[(stride + 1) * height];
         for (var y = 0; y < height; y++)
@@ -253,8 +241,8 @@ internal static class ScreenshotCapturer
         var ihdr = new byte[13];
         BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(0, 4), width);
         BinaryPrimitives.WriteInt32BigEndian(ihdr.AsSpan(4, 4), height);
-        ihdr[8] = 8; // bit depth
-        ihdr[9] = 2; // color type: truecolor RGB
+        ihdr[8] = 8;
+        ihdr[9] = 2;
         WriteChunk(fs, "IHDR", ihdr);
         WriteChunk(fs, "IDAT", idat.ToArray());
         WriteChunk(fs, "IEND", Array.Empty<byte>());

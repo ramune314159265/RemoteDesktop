@@ -88,8 +88,6 @@ internal sealed class SignalingServer
 
         var app = builder.Build();
         _app = app;
-        // KeepAlive の Ping で、電源断・Wi-Fi切断など「無言で切れた」接続を検出する
-        // (放置すると古い接続が残り、再接続が "busy" で拒否される原因になる)
         app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(15) });
         app.Run(HandleContextAsync);
 
@@ -138,7 +136,6 @@ internal sealed class SignalingServer
             {
                 loaded = new X509Certificate2(o.CertPath, o.CertPassword);
             }
-            // Windows(SChannel) では PEM 由来の鍵はエフェメラルだと TLS で使えないため再インポートする
             return new X509Certificate2(loaded.Export(X509ContentType.Pfx), (string?)null, X509KeyStorageFlags.Exportable);
         }
 
@@ -218,8 +215,6 @@ internal sealed class SignalingServer
     {
         if (ctx.Request.Path != _wsPath)
         {
-            // WebSocket アップグレード対象外(ヘルスチェック/OPTIONS)の場合のみ
-            // CORS ヘッダーを付与する(101 応答に混ぜると Safari が拒否することがある)。
             ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
 
             if (ctx.Request.Method == "OPTIONS")
@@ -352,7 +347,6 @@ internal sealed class SignalingClient
                     }
                     catch (Exception ex)
                     {
-                        // 1メッセージの処理失敗で接続全体(=配信セッション)を落とさない
                         Console.WriteLine($"[Signaling] MessageReceived handler error: {ex}");
                     }
                 }

@@ -19,8 +19,6 @@ namespace RemoteDesktopHost;
 /// </summary>
 internal static class InputInjector
 {
-    // ---- Win32 構造体定義 -------------------------------------------------------
-
     [StructLayout(LayoutKind.Sequential)]
     private struct MOUSEINPUT
     {
@@ -88,26 +86,6 @@ internal static class InputInjector
 
     private static readonly int InputSize = Marshal.SizeOf<INPUT>();
 
-    // ---- タッチ (CreateSyntheticPointerDevice / InjectSyntheticPointerInput) ----------
-    //
-    // 経緯: 当初は Windows 8 世代の InitializeTouchInjection / InjectTouchInput で実装したが、
-    // 構造体レイアウト・フラグの組み合わせ・座標範囲・タッチデジタイザの有無・DPI設定を
-    // 一通り検証しても down/move/up すべてで ERROR_INVALID_PARAMETER (87) が解消しなかった。
-    // そのため、Windows 10 1809 以降で使える新しい注入API
-    // (CreateSyntheticPointerDevice / InjectSyntheticPointerInput) に切り替える。
-    //
-    // 旧APIとの主な違い:
-    // - プロセス全体で一度だけ初期化する(InitializeTouchInjection)のではなく、
-    //   明示的な「注入デバイスハンドル」(HSYNTHETICPOINTERDEVICE)を CreateSyntheticPointerDevice
-    //   で作成し、そのハンドルを InjectSyntheticPointerInput に渡す。
-    // - このハンドルは「作成したスレッドに紐づく」ため、旧APIと同様に
-    //   InjectSyntheticPointerInput を呼ぶスレッドごとに、そのスレッドでハンドルを
-    //   作成しておく必要がある。
-    // - 注入する構造体は POINTER_TOUCH_INFO 自体は変わらず、それを POINTER_TYPE_INFO で
-    //   ラップして渡す形になる。
-    //
-    // まずはリスクを減らすためシングルタッチ(同時に1点のみ)に限定して実装する。
-
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT
     {
@@ -154,10 +132,6 @@ internal static class InputInjector
         public uint pressure;
     }
 
-    // POINTER_TYPE_INFO は本来 { type; union { POINTER_INFO; POINTER_TOUCH_INFO; POINTER_PEN_INFO; } } という
-    // 共用体だが、この実装ではタッチしか使わないため touchInfo だけを明示的にオフセット8(type分4byte+パディング4byte)
-    // に配置する形で必要十分な部分だけを再現する。count=1でしか使わない(配列化しない)ため、
-    // 共用体の最大サイズ(pen込みで152byte)に厳密に合わせる必要はない。
     [StructLayout(LayoutKind.Explicit)]
     private struct POINTER_TYPE_INFO
     {
@@ -177,25 +151,19 @@ internal static class InputInjector
     private const uint TOUCH_MASK_CONTACTAREA = 0x00000001;
     private const uint TOUCH_MASK_PRESSURE = 0x00000004;
 
-    // pressure は 0〜1024 の範囲で、1024 が最大圧力を意味する。
     private const uint TOUCH_PRESSURE_MAX = 1024;
 
-    // POINTER_FEEDBACK_MODE.POINTER_FEEDBACK_DEFAULT = 1 (旧APIのTOUCH_FEEDBACK_DEFAULTと同値)
     private const int POINTER_FEEDBACK_DEFAULT = 1;
 
-    // 同時に扱えるタッチ数。CreateSyntheticPointerDevice の maxCount にもそのまま使う。
     private const uint MaxTouchContacts = 10;
 
     private sealed class TouchState
     {
         public uint PointerId;
-        // 絶対デスクトップ座標(仮想画面相対への変換は注入直前に行う)。
         public int X;
         public int Y;
     }
 
-    // JS の Touch.identifier (ブラウザによっては大きい値/負の値になり得る) を、
-    // Win32 の pointerId 用に 0〜MaxTouchContacts-1 の小さい値へマッピングして管理する。
     private static readonly Dictionary<int, TouchState> ActiveTouches = new();
     private static readonly Queue<uint> FreeTouchSlots = BuildInitialTouchSlots();
 
@@ -209,25 +177,14 @@ internal static class InputInjector
     private static readonly object TouchLock = new();
     private static uint _touchFrameId;
 
-    // HandleTouch (呼び出し元はDataChannelのコールバックスレッド)で反映した状態変化のうち、
-    // まだ実際に注入(Inject)していない分。専用スレッド側で読み取って消費する。
     private static readonly HashSet<int> PendingNewDownIds = new();
     private static readonly HashSet<int> PendingEndingIds = new();
 
-    // 「触れているが動いていない」状態でもWindows側に継続的にタッチ信号を送り続けるための
-    // 専用スレッド。これが無いと、ブラウザは touchmove を発火しない=何も送られない状態になり、
-    // Windows の「長押しで右クリック」ジェスチャー判定が正しく働かない
-    // (実タッチデジタイザは静止中も一定間隔で信号を送り続けているのが前提のため)。
-    // 単指静止/単指移動後静止/複数指、のいずれについても、ここでは判定ロジックを持たず、
-    // 単に「今の状態のまま」の信号を送り続けるだけにする。実際の長押し→右クリック昇格や
-    // 複数指の除外判定は Windows 自身のジェスチャー認識エンジンに任せる。
     private const int TouchKeepAliveIntervalMs = 30;
     private static readonly AutoResetEvent TouchWakeEvent = new(false);
     private static Thread? _touchInjectorThread;
     private static readonly object TouchThreadStartLock = new();
 
-    // CreateSyntheticPointerDevice が返すハンドルは「作成したスレッドに紐づく」ため、
-    // InjectSyntheticPointerInput を呼ぶスレッドごとに(初回のみ)個別に作成する必要がある。
     [ThreadStatic]
     private static IntPtr _touchDeviceOnThisThread;
 
@@ -237,11 +194,6 @@ internal static class InputInjector
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool InjectSyntheticPointerInput(IntPtr device, POINTER_TYPE_INFO[] pointerInfo, uint count);
 
-    [DllImport("user32.dll")]
-    private static extern void DestroySyntheticPointerDevice(IntPtr device);
-
-    // 診断用: 送信しようとしている座標が実際に「デスクトップの範囲内」に収まっているか
-    // 確認するために、仮想デスクトップ(全モニターを包含する矩形)の範囲を取得する。
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int nIndex);
 
@@ -338,7 +290,6 @@ internal static class InputInjector
 
                     case "up":
                     case "cancel":
-                        // 受信した座標は使わず、直前の move で保持している座標をそのまま使う。
                         if (ActiveTouches.ContainsKey(t.Id))
                         {
                             PendingEndingIds.Add(t.Id);
@@ -352,7 +303,6 @@ internal static class InputInjector
             }
         }
 
-        // 実際の注入は専用スレッドに任せる。すぐに反映されるよう起こしておく。
         TouchWakeEvent.Set();
     }
 
@@ -417,9 +367,6 @@ internal static class InputInjector
                 {
                     uint flags;
 
-                    // down->up が1サイクル内で両方保留になっているケース(非常に短いタップ等)では、
-                    // 先に down を送ってから、次のサイクルで up を送る(同一フレームで
-                    // 「無→UP」にはできないため)。
                     if (PendingNewDownIds.Contains(jsId))
                     {
                         flags = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
@@ -432,13 +379,9 @@ internal static class InputInjector
                     }
                     else
                     {
-                        // 実際に動いたかどうかに関わらず UPDATE として送り続ける
-                        // (静止したままのキープアライブもこれで表現する)。
                         flags = POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
                     }
 
-                    // ptPixelLocation は「仮想画面の左上基準の相対座標」を要求するため、
-                    // ここで絶対座標から変換する(state.X/Y自体は絶対座標のまま)。
                     var (injectX, injectY) = ToVirtualScreenRelative(state.X, state.Y);
                     var contact = BuildTouchInfo(state.PointerId, injectX, injectY, flags, _touchFrameId);
                     wrapped[i++] = new POINTER_TYPE_INFO { type = (uint)PT_TOUCH, touchInfo = contact };
@@ -489,8 +432,6 @@ internal static class InputInjector
         };
     }
 
-    // 現在配信中の領域(オフセット+サイズ)。switchSource で切り替わるたびに更新される。
-    // 既定値はプライマリモニタ全体。
     private static ScreenGeometry.Rect _captureRegion = ScreenGeometry.PrimaryMonitorFallback;
 
     /// <summary>
@@ -502,8 +443,6 @@ internal static class InputInjector
         _captureRegion = region;
         Console.WriteLine($"[Input] Capture region updated: x={region.X}, y={region.Y}, w={region.Width}, h={region.Height}");
     }
-
-    // ---- 公開API ----------------------------------------------------------------
 
     /// <summary>
     /// false の間は、すべての入力(マウス/キーボード/タッチ)を無視する。
@@ -554,8 +493,6 @@ internal static class InputInjector
         }
         catch (Exception ex)
         {
-            // Handle() は DataChannel の受信コールバック(リバース P/Invoke)から直接
-            // 呼ばれるため、ここでも必ず例外を握りつぶしてログに残す。
             Console.WriteLine($"[Input][FATAL] {ex}");
         }
     }
@@ -644,8 +581,6 @@ internal static class InputInjector
         SendInput(1, new[] { input }, InputSize);
     }
 
-    // ブラウザの KeyboardEvent.code (物理キー位置ベース、レイアウト非依存) から
-    // Windows 仮想キーコード (VK_*) への対応表。
     private static readonly Dictionary<string, ushort> KeyCodeMap = BuildKeyCodeMap();
 
     private static Dictionary<string, ushort> BuildKeyCodeMap()

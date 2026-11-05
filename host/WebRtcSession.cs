@@ -21,7 +21,6 @@ internal sealed class WebRtcSession : IDisposable
     private Pipeline? _pipeline;
     private IntPtr _webrtcHandle;
 
-    // ネイティブコールバックは GC で回収されないよう参照を保持し続ける必要がある。
     private GstNativeInterop.NegotiationNeededCallback? _onNegotiationNeeded;
     private GstNativeInterop.IceCandidateCallback? _onIceCandidate;
     private GstNativeInterop.PromiseChangeFunc? _onOfferCreated;
@@ -35,15 +34,14 @@ internal sealed class WebRtcSession : IDisposable
     private IntPtr _volumeHandle;
     private IntPtr _captureSourceHandle;
 
-    // 映像の入力切り替え(input-selector): キャプチャ映像 / 黒画面(「映像なし」用)
     private IntPtr _videoSelectorHandle;
     private Pad? _captureSelPad;
     private Pad? _blackSelPad;
-    private bool _burstActive;      // 接続時テスト映像(実験機能)を流している間
-    private bool _videoDisabled;      // 「映像なし」(音声のみ)中
-    private volatile int _captureWidth;   // 直近のキャプチャ解像度(切り替え時に解像度が同じか判定する)
+    private bool _burstActive;
+    private bool _videoDisabled;
+    private volatile int _captureWidth;
     private volatile int _captureHeight;
-    private int _currentMonitorIndex; // 現在モニター配信中の番号(スクリーンショットの撮影範囲に使う)
+    private int _currentMonitorIndex;
     private Element? _captureSourceElement;
     private Element? _videoQueue1Element;
     private Element? _videoEncoderElement;
@@ -66,34 +64,29 @@ internal sealed class WebRtcSession : IDisposable
 
     private uint _currentBitrateKbps;
 
-    // 直近に「切り替えを試みた」ソース設定。エラー発生時、これより前に有効だった
-    // 設定へロールバックするのではなく、常に安全なプライマリモニタへ戻す簡易実装。
     private DateTime _lastVideoBranchRecovery = DateTime.MinValue;
     private static readonly TimeSpan VideoBranchRecoveryDebounce = TimeSpan.FromSeconds(2);
 
-    // ウィンドウ配信中、対象ウィンドウがリサイズされた場合にマウス座標マッピングを
-    // 追従させるためのポーリング。リアルタイムなイベント通知(WinEventHook等)は
-    // 実装コストが高いため、軽量な debounce ポーリング(既定500ms間隔)で対応する。
     private Timer? _resizeWatchTimer;
     private IntPtr? _currentWindowHandle;
     private ScreenGeometry.Rect? _lastKnownWindowRect;
     private static readonly TimeSpan ResizeWatchInterval = TimeSpan.FromMilliseconds(500);
 
-    // --- クライアント解像度への追従(ウィンドウ配信時) ---
-    // アスペクト比の計算はクライアント側の責務とし、サーバーは指定された
-    // 「クライアント領域(配信される映像そのもの)のサイズ」をそのまま適用するだけにする。
-    private ScreenGeometry.Rect? _originalWindowRect; // 配信開始前の位置・サイズ(終了時に復元する)
-    private (int Width, int Height)? _lastClientRequestedSize; // クライアントが最後に要求したクライアント領域サイズ
-    private (int Width, int Height)? _lastRequestedWindowSize; // それを実現するために実際にリクエストした「ウィンドウ全体」のサイズ
+    private ScreenGeometry.Rect? _originalWindowRect;
+    private (int Width, int Height)? _lastClientRequestedSize;
+    private (int Width, int Height)? _lastRequestedWindowSize;
+    private (int Width, int Height)? _independentWindowSize;
+    private readonly System.Collections.Concurrent.BlockingCollection<Action> _controlWork = new();
+    private readonly object _viewportLock = new();
+    private (int Width, int Height)? _pendingViewport;
+    private const int WindowSizeTolerance = 2;
+    private const int MaxResizeAttempts = 3;
+    private const int ResizeSettleDelayMs = 120;
 
-    // --- タイトルバー等(WS_OVERLAPPEDWINDOW)の着脱 ---
-    // 配信のために位置・スタイルを変更したウィンドウと、変更前のタイトルバー等のスタイルビット。
-    // _currentWindowHandle(配信が確定した後で設定される)とは別に、「変更した時点」で記録する。
-    // (切り替えの途中で失敗した場合でも、変更済みのウィンドウを必ず元に戻せるようにするため)
     private IntPtr? _trackedWindowHandle;
     private int _originalStyleBits;
     private bool _stripSucceeded;
-    private readonly object _windowLock = new(); // ウィンドウ状態の変更・復元を直列化する
+    private readonly object _windowLock = new();
     private bool _windowStateDisposed;
     private int _styleStripAttempts;
     private const int MaxStyleStripAttempts = 2;
@@ -138,10 +131,6 @@ internal sealed class WebRtcSession : IDisposable
 
         _burstActive = _config.StartupBurstMs > 0 && _config.EnablePlayoutDelay && !_config.UseTestSource;
 
-        // videoconvert -> vcrop の間(vcropのsinkパッド)の caps 変更を "notify::caps"
-        // シグナル(GObjectの標準的なプロパティ変更通知)で監視し、
-        // 奇数サイズが来たら即座に vcrop の right/bottom を設定して偶数に丸める。
-        // ウィンドウのリサイズで再ネゴシエーションが起きるたびに自動で追従する。
         var vcropSinkPad = _videoCropElement?.GetStaticPad("sink");
         if (vcropSinkPad is not null)
         {
@@ -160,21 +149,11 @@ internal sealed class WebRtcSession : IDisposable
         _pipeline.SetState(State.Playing);
         Console.WriteLine("[Session] Pipeline is PLAYING");
 
-        // 既定はプライマリモニタ全体の配信なので、マウス座標マッピングもそれに合わせる。
         InputInjector.SetCaptureRegion(ScreenGeometry.GetMonitorRect(0) ?? ScreenGeometry.PrimaryMonitorFallback);
 
-        // マウス/キーボード等の制御入力用 DataChannel。
-        // webrtcbin がまだ NULL 状態のうちに create-data-channel を呼ぶと
-        // SCTP トランスポートが正しく準備されないことがあるため、
-        // パイプラインを PLAYING にしてから作成する。
-        // (これにより初回オファーに含まれず、作成時点で on-negotiation-needed が
-        //  再度発火して2回目のネゴシエーションが走る可能性があるが、
-        //  ブラウザ側は setRemoteDescription を都度受け入れる作りなので問題ない)
+        StartControlWorker();
         CreateControlDataChannel();
 
-        // ウィンドウ配信中のリサイズにマウス座標マッピングを追従させるための
-        // 軽量ポーリング(debounce)。_currentWindowHandle が null の間(モニター配信中)は
-        // 何もしない。
         _resizeWatchTimer = new Timer(OnResizeWatchTick, null, ResizeWatchInterval, ResizeWatchInterval);
     }
 
@@ -215,7 +194,6 @@ internal sealed class WebRtcSession : IDisposable
     {
         try
         {
-            // 切り替え/復元と同時に走らないよう直列化する(ロック待ちになる場合は今回は見送る)
             if (!Monitor.TryEnter(_windowLock)) return;
             try
             {
@@ -238,11 +216,8 @@ internal sealed class WebRtcSession : IDisposable
         try
         {
             if (_currentWindowHandle is not { } hwnd) return;
-            if (!ScreenGeometry.IsWindow(hwnd)) return; // ウィンドウが閉じられた等。エラー処理は別途 SwitchSource/RecoverVideoBranch 側で行う。
+            if (!ScreenGeometry.IsWindow(hwnd)) return;
 
-            // タイトルバーを剥がした後、何らかの理由で復活していないか確認する。
-            // (アプリが自前で再度スタイルを設定し直す、テーマ変更等で起こり得る)
-            // 連続して復活し続ける場合は無限ループを避けるため一定回数で諦める。
             if (_stripSucceeded && ScreenGeometry.HasOverlappedWindowStyle(hwnd))
             {
                 if (_styleStripAttempts < MaxStyleStripAttempts)
@@ -257,8 +232,6 @@ internal sealed class WebRtcSession : IDisposable
                 }
             }
 
-            // タイトルバーの高さ自体はほぼ変わらないが、毎回計算しても軽量なので
-            // 移動やテーマ変更にも追従できるよう都度再計算する。
             var clientRect = ApplyWindowChromeCrop(hwnd);
             if (clientRect is null) return;
 
@@ -273,27 +246,27 @@ internal sealed class WebRtcSession : IDisposable
 
                 if (sizeChanged)
                 {
-                    // 今回のサイズ変化が「こちらが直前にリクエストした通り」かどうかを確認する。
                     var windowRect = ScreenGeometry.GetWindowRectSafe(hwnd);
+                    if (windowRect is not null && _stripSucceeded && ScreenGeometry.HasOverlappedWindowStyle(hwnd))
+                    {
+                        Console.WriteLine("[Config] Window title bar reappeared after resize, removing again");
+                        _styleStripAttempts = 0;
+                        ScreenGeometry.RemoveOverlappedWindowStyle(hwnd);
+                        clientRect = ApplyWindowChromeCrop(hwnd) ?? clientRect;
+                        windowRect = ScreenGeometry.GetWindowRectSafe(hwnd) ?? windowRect;
+                        _lastKnownWindowRect = clientRect;
+                        InputInjector.SetCaptureRegion(clientRect.Value);
+                    }
+
                     if (windowRect is not null)
                     {
                         var matchesRequested = _lastRequestedWindowSize is { } req
-                            && Math.Abs(windowRect.Value.Width - req.Width) <= 2
-                            && Math.Abs(windowRect.Value.Height - req.Height) <= 2;
+                            && IsSimilarSize((windowRect.Value.Width, windowRect.Value.Height), req);
 
-                        if (matchesRequested)
+                        if (!matchesRequested)
                         {
-                            // こちら(ApplyRequestedClientSize)がリクエストした変更が反映された。
-                            // WGC の再初期化はそちらで既に同期的に行い済みなので、ここでは何もしない。
-                        }
-                        else
-                        {
-                            // アプリが自発的にサイズを変えた(こちらの要求とは無関係)。
-                            // ここでは配信サイズ(WGC)はまだ変えない。まずクライアントに
-                            // 新しいサイズを通知し、クライアントが希望サイズを返してきたら
-                            // ApplyRequestedClientSize 側でウィンドウのリサイズと配信の
-                            // 更新をまとめて行う。
                             _lastRequestedWindowSize = (windowRect.Value.Width, windowRect.Value.Height);
+                            _independentWindowSize = _lastRequestedWindowSize;
                             Console.WriteLine($"[Config] Window resized independently to {clientRect.Value.Width}x{clientRect.Value.Height} (client area), notifying client");
                             SendWindowResized(clientRect.Value.Width, clientRect.Value.Height);
                         }
@@ -340,7 +313,6 @@ internal sealed class WebRtcSession : IDisposable
                 GstNativeInterop.SetObject(asel.Handle, "active-pad", realAudioPad.Handle);
             }
             Console.WriteLine("[Burst] キャプチャ映像/実音声へ切り替えました");
-            // クライアントへ「テスト映像が終わった」ことを通知する(クライアントはそれまで video をミュートにする)
             if (_controlChannelHandle != IntPtr.Zero && _isControlChannelOpen)
             {
                 GstNativeInterop.DataChannelSendString(_controlChannelHandle, JsonSerializer.Serialize(new { type = "burstEnd" }));
@@ -421,20 +393,19 @@ internal sealed class WebRtcSession : IDisposable
                     break;
 
                 case "switchSource":
-                    SwitchSource(msg);
+                    EnqueueControlWork(() => SwitchSource(msg));
                     break;
 
                 case "listSources":
-                    SendSourceList();
+                    EnqueueControlWork(SendSourceList);
                     break;
 
                 case "screenshot":
-                    // GDI での撮影と PNG 保存は時間がかかるため、DataChannel の受信スレッドを塞がない
                     var screenshotTask = Task.Run(TakeScreenshot);
                     break;
 
                 case "setViewportSize":
-                    HandleViewportSize(msg.ViewportWidth, msg.ViewportHeight);
+                    QueueViewportSize(msg.ViewportWidth, msg.ViewportHeight);
                     break;
 
                 default:
@@ -446,6 +417,58 @@ internal sealed class WebRtcSession : IDisposable
         {
             Console.WriteLine($"[Input][FATAL in OnControlChannelMessage] {ex}");
         }
+    }
+
+    /// <summary>
+    /// 切り替えやリサイズはキャプチャ要素の状態変更などで時間がかかる。DataChannel の受信スレッド
+    /// (SCTP スレッド)で実行すると受信が止まり、接続が切れる原因になるため、専用スレッドで順番に処理する。
+    /// </summary>
+    private void StartControlWorker()
+    {
+        var worker = new Thread(() =>
+        {
+            foreach (var work in _controlWork.GetConsumingEnumerable())
+            {
+                try { work(); }
+                catch (Exception ex) { Console.WriteLine($"[Input][FATAL in control worker] {ex}"); }
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "control-worker",
+        };
+        worker.Start();
+    }
+
+    private void EnqueueControlWork(Action work)
+    {
+        try { _controlWork.Add(work); }
+        catch (InvalidOperationException) { }
+    }
+
+    /// <summary>連続して届くサイズ変更は最新の1件だけを処理する。</summary>
+    private void QueueViewportSize(int? width, int? height)
+    {
+        if (width is null || height is null || width <= 0 || height <= 0) return;
+
+        bool schedule;
+        lock (_viewportLock)
+        {
+            schedule = _pendingViewport is null;
+            _pendingViewport = (width.Value, height.Value);
+        }
+        if (!schedule) return;
+
+        EnqueueControlWork(() =>
+        {
+            (int Width, int Height) size;
+            lock (_viewportLock)
+            {
+                size = _pendingViewport!.Value;
+                _pendingViewport = null;
+            }
+            HandleViewportSize(size.Width, size.Height);
+        });
     }
 
     private void SetBitrate(uint? kbps)
@@ -461,7 +484,6 @@ internal sealed class WebRtcSession : IDisposable
             return;
         }
 
-        // nvh264enc の "bitrate" プロパティは kbit/s 単位(x264enc と同じ慣習)。
         GstNativeInterop.SetUInt(_videoEncoderHandle, "bitrate", kbps.Value);
         _currentBitrateKbps = kbps.Value;
         Console.WriteLine($"[Config] Bitrate set to {kbps.Value} kbps");
@@ -530,20 +552,15 @@ internal sealed class WebRtcSession : IDisposable
                 return;
             }
 
-            // 最小化されていると WGC がキャプチャできないため、事前に復元する。
             WindowEnumerator.RestoreIfMinimized(hwnd);
 
             if (_currentWindowHandle != hwnd)
             {
-                // 別のウィンドウへの切り替えなら、前のウィンドウを元の位置・サイズ・スタイルへ
-                // 戻してから、新しいウィンドウの「切り替え前」の状態を記録して
-                // 指定モニターへ移動する。
                 RestoreOriginalWindowRectIfNeeded();
                 _originalWindowRect = ScreenGeometry.GetWindowRectSafe(hwnd);
                 _lastRequestedWindowSize = null;
+            _independentWindowSize = null;
 
-                // 変更に入る前に「元の状態」を記録する(途中で失敗しても復元できるようにするため、
-                // 位置の移動・スタイル変更より前に追跡対象として登録する)。
                 _trackedWindowHandle = hwnd;
                 _originalStyleBits = ScreenGeometry.GetOverlappedStyleBits(hwnd);
                 _stripSucceeded = false;
@@ -551,10 +568,6 @@ internal sealed class WebRtcSession : IDisposable
 
                 MoveWindowToTargetMonitor(hwnd);
 
-                // タイトルバー等(WS_OVERLAPPEDWINDOW)を取り除く。これにより
-                // GetWindowRect(見た目)とクライアント領域(キャプチャ範囲)の差が
-                // 無くなり、タイトルバー分のクロップ/ズレが原理的に発生しなくなる。
-                // 配信開始前に持っていたビットだけを記録し、終了時はそのビットだけを戻す。
                 _styleStripAttempts = 0;
                 if (_originalStyleBits != 0)
                 {
@@ -562,21 +575,17 @@ internal sealed class WebRtcSession : IDisposable
                 }
             }
 
-            var winRect = ScreenGeometry.GetWindowRectSafe(hwnd);
-            SwitchCaptureViaBlack(winRect?.Width ?? 0, winRect?.Height ?? 0, () =>
+            ApplySourceSwitch(() =>
             {
                 GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", msg.WindowHandle.Value);
             });
+            EnableCaptureInput();
 
             var clientRect = ApplyWindowChromeCrop(hwnd);
             InputInjector.SetCaptureRegion(clientRect ?? ScreenGeometry.PrimaryMonitorFallback);
             _currentWindowHandle = hwnd;
             _lastKnownWindowRect = clientRect;
 
-            // サイズの決定はここで即座に(以前のクライアント希望値を使って)行わず、
-            // 「アプリが自発的にリサイズした」場合と同じ通知→応答フローに統一する。
-            // 現在のクライアント領域サイズをまず通知し、クライアントが計算した
-            // 希望サイズが返ってきたら ApplyRequestedClientSize 側で適用する。
             _lastRequestedWindowSize = ScreenGeometry.GetWindowRectSafe(hwnd) is { } wr ? (wr.Width, wr.Height) : null;
             SendWindowResized(clientRect.Value.Width, clientRect.Value.Height);
         }
@@ -595,7 +604,6 @@ internal sealed class WebRtcSession : IDisposable
             var targetMonitorRect = ScreenGeometry.GetMonitorRect(msg.MonitorIndex.Value);
             SwitchCaptureViaBlack(targetMonitorRect?.Width ?? 0, targetMonitorRect?.Height ?? 0, () =>
             {
-                // window-handle を 0 に戻してウィンドウキャプチャモードを解除する。
                 GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", 0);
                 GstNativeInterop.SetInt(_captureSourceHandle, "monitor-index", msg.MonitorIndex.Value);
             });
@@ -609,8 +617,6 @@ internal sealed class WebRtcSession : IDisposable
         }
         else if (msg.SourceMode == "none")
         {
-            // 「映像なし」: 映像は黒画面(<video> 要素は残す)、音声は配信し続ける。
-            // 見えない画面を操作されないよう、入力操作は無効にする。
             RestoreOriginalWindowRectIfNeeded();
             _currentWindowHandle = null;
             _lastKnownWindowRect = null;
@@ -623,7 +629,6 @@ internal sealed class WebRtcSession : IDisposable
                 GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _blackSelPad.Handle);
             }
 
-            // キャプチャ自体も止めて負荷を下げる(次の切り替えで ApplySourceSwitch が再開する)
             _captureSourceElement.SetLockedState(true);
             _captureSourceElement.SetState(State.Ready);
             Console.WriteLine("[Config] 映像なし(音声のみ)に切り替えました");
@@ -650,7 +655,6 @@ internal sealed class WebRtcSession : IDisposable
         var spec = _config.WindowTargetMonitorName?.Trim();
         if (string.IsNullOrEmpty(spec)) return _config.WindowTargetMonitorIndex;
 
-        // "名前#2" -> 名前に一致する2番目
         var nth = 1;
         var hash = spec.LastIndexOf('#');
         if (hash > 0 && int.TryParse(spec[(hash + 1)..], out var n) && n >= 1)
@@ -732,20 +736,53 @@ internal sealed class WebRtcSession : IDisposable
         var x = monitorRect.X + Math.Max(0, (monitorRect.Width - windowWidth) / 2);
         var y = monitorRect.Y + Math.Max(0, (monitorRect.Height - windowHeight) / 2);
 
-        Console.WriteLine($"[Config] Resizing window: clientArea={clientWidth}x{clientHeight} -> window={windowWidth}x{windowHeight}");
-        ScreenGeometry.MoveResizeWindow(hwnd, x, y, windowWidth, windowHeight);
-        _lastRequestedWindowSize = (windowWidth, windowHeight);
+        var independentSize = _independentWindowSize;
+        var requested = (Width: windowWidth, Height: windowHeight);
+        var before = ScreenGeometry.GetWindowRectSafe(hwnd);
+        (int Width, int Height)? actual = null;
 
-        // ポーリング(最大500ms後)を待たず、この場で反映させる。
+        for (var attempt = 1; attempt <= MaxResizeAttempts; attempt++)
+        {
+            Console.WriteLine($"[Config] Resizing window: clientArea={clientWidth}x{clientHeight} -> window={windowWidth}x{windowHeight} (attempt {attempt}/{MaxResizeAttempts})");
+            ScreenGeometry.MoveResizeWindow(hwnd, x, y, windowWidth, windowHeight);
+            Thread.Sleep(ResizeSettleDelayMs);
+
+            var rect = ScreenGeometry.GetWindowRectSafe(hwnd);
+            if (rect is null) break;
+            actual = (rect.Value.Width, rect.Value.Height);
+
+            if (IsSimilarSize(actual.Value, requested)) break;
+
+            if (independentSize is { } independent && IsSimilarSize(actual.Value, independent))
+            {
+                Console.WriteLine($"[Config] Window returned to its own size {actual.Value.Width}x{actual.Value.Height}, giving up resizing");
+                break;
+            }
+
+            Console.WriteLine($"[Config] Window size is {actual.Value.Width}x{actual.Value.Height}, differs from requested, retrying");
+        }
+
+        _independentWindowSize = null;
+        _lastRequestedWindowSize = actual ?? requested;
+
         var clientRect = ApplyWindowChromeCrop(hwnd);
         InputInjector.SetCaptureRegion(clientRect ?? ScreenGeometry.PrimaryMonitorFallback);
         _lastKnownWindowRect = clientRect;
+
+        var finalSize = actual ?? requested;
+        var sizeChanged = before is null
+            || !IsSimilarSize((before.Value.Width, before.Value.Height), finalSize);
+        if (!sizeChanged) return;
 
         ApplySourceSwitch(() =>
         {
             GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", (ulong)hwnd.ToInt64());
         });
     }
+
+    private static bool IsSimilarSize((int Width, int Height) a, (int Width, int Height) b)
+        => Math.Abs(a.Width - b.Width) <= WindowSizeTolerance
+        && Math.Abs(a.Height - b.Height) <= WindowSizeTolerance;
 
     /// <summary>ウィンドウが(こちらの意図とは無関係に)新しいサイズになったことをクライアントへ知らせる。</summary>
     private void SendWindowResized(int clientWidth, int clientHeight)
@@ -760,8 +797,6 @@ internal sealed class WebRtcSession : IDisposable
     {
         lock (_windowLock)
         {
-            // 配信が確定する前(切り替え途中の失敗)でも元に戻せるよう、
-            // _currentWindowHandle ではなく「変更した時点で記録した」ハンドルを使う。
             if (_trackedWindowHandle is { } hwnd)
             {
                 if (ScreenGeometry.IsWindow(hwnd))
@@ -788,6 +823,7 @@ internal sealed class WebRtcSession : IDisposable
             _originalWindowRect = null;
             _styleStripAttempts = 0;
             _lastRequestedWindowSize = null;
+            _independentWindowSize = null;
         }
     }
 
@@ -799,8 +835,6 @@ internal sealed class WebRtcSession : IDisposable
     /// </summary>
     private void SwitchCaptureViaBlack(int targetWidth, int targetHeight, Action applyProperties)
     {
-        // 解像度が変わる切り替えはエンコーダが自然に再初期化されるため黒画面は不要。
-        // 現在の解像度が不明、または切り替え先と同じ(または判定不能)の場合のみ挟む。
         var sameResolution = targetWidth <= 0 || targetHeight <= 0
             || (_captureWidth == targetWidth && _captureHeight == targetHeight);
 
@@ -809,12 +843,12 @@ internal sealed class WebRtcSession : IDisposable
         {
             GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _blackSelPad.Handle);
             bridged = true;
-            Thread.Sleep(200); // 黒画面を数フレーム流し、エンコーダに解像度変更を認識させる
+            Thread.Sleep(200);
         }
 
         ApplySourceSwitch(applyProperties);
 
-        if (bridged) _videoDisabled = true; // EnableCaptureInput にキャプチャへ戻させる
+        if (bridged) _videoDisabled = true;
         EnableCaptureInput();
     }
 
@@ -844,9 +878,9 @@ internal sealed class WebRtcSession : IDisposable
     /// <summary>
     /// キャプチャ/エンコードに失敗した場合の保険的な自動復旧。
     ///
-    /// x264enc は一度初期化に失敗すると、単純に NULL -> PLAYING と状態を
+    /// video encoder は一度初期化に失敗すると、単純に NULL -> PLAYING と状態を
     /// 遷移させるだけでは内部状態が正しくリセットされず、同じ映像が来ても
-    /// 再度失敗し続けることが実機で確認された。そのため x264enc だけは
+    /// 再度失敗し続けることが実機で確認された。そのため video encoder だけは
     /// 要素そのものを破棄して新しいインスタンスを作り直す(パイプラインに
     /// 差し込み直す)方式にしている。capturesrc/queue/payloader は
     /// 通常の NULL -> PLAYING サイクルで十分なため、そちらはそのまま。
@@ -854,8 +888,6 @@ internal sealed class WebRtcSession : IDisposable
     /// </summary>
     private void RecoverVideoBranch()
     {
-        // 同一障害から立て続けに複数の ERROR メッセージが飛んでくることが多いため、
-        // 短時間のうちに何度も復旧処理を走らせないようデバウンスする。
         var now = DateTime.UtcNow;
         if (now - _lastVideoBranchRecovery < VideoBranchRecoveryDebounce) return;
         _lastVideoBranchRecovery = now;
@@ -878,10 +910,6 @@ internal sealed class WebRtcSession : IDisposable
                 GstNativeInterop.SetInt(_captureSourceHandle, "monitor-index", 0);
             }
 
-            // 新しい x264enc をリンクまでは行うが、まだ PLAYING にはしない。
-            // 周囲の要素がまだ NULL のうちにエンコーダだけ先に PLAYING へ同期させると
-            // 不安定になる(クラッシュする)ことが実機で確認されたため、
-            // 「周辺を先に立ち上げてから、最後にエンコーダを立ち上げる」順序にしている。
             var newVenc = RecreateVideoEncoderLinkOnly();
 
             foreach (var el in stateCycleElements)
@@ -913,7 +941,7 @@ internal sealed class WebRtcSession : IDisposable
     }
 
     /// <summary>
-    /// x264enc 要素を破棄し、同じプロパティで新しいインスタンスを作り直してパイプラインに
+    /// video encoder 要素を破棄し、同じプロパティで新しいインスタンスを作り直してパイプラインに
     /// 繋ぎ直す。ここでは PLAYING への遷移は行わない(呼び出し元が周囲の要素を
     /// PLAYING に戻した後、最後にこの戻り値を PLAYING にすること)。
     /// gst_parse_bin_from_description を使うことで、tune 等の enum/flags プロパティも
@@ -927,7 +955,7 @@ internal sealed class WebRtcSession : IDisposable
             return null;
         }
 
-        Console.WriteLine("[Config] Recreating x264enc element (full reset) ...");
+        Console.WriteLine("[Config] Recreating video encoder element (full reset) ...");
 
         var oldVenc = _videoEncoderElement;
         var beforePad = _videoConvert2Element.GetStaticPad("src");
@@ -945,9 +973,6 @@ internal sealed class WebRtcSession : IDisposable
 
         var desc = BuildVideoEncoderDescription(_config, _currentBitrateKbps);
         var newVenc = Parse.BinFromDescription(desc, true);
-        // Bin に追加すると GstBin が自動的に親(パイプライン)の現在の状態へ
-        // 同期させようとすることがあるため、ロックして防いでおく。
-        // 明示的に PLAYING にするのは呼び出し元が周囲の要素を立ち上げた後。
         newVenc.SetLockedState(true);
         _pipeline.Add(newVenc);
 
@@ -958,11 +983,9 @@ internal sealed class WebRtcSession : IDisposable
         if (afterPad is not null && newSrc is not null) newSrc.Link(afterPad);
 
         _videoEncoderElement = newVenc;
-        // BinFromDescription はラップした Bin を返すため、bitrate 等のプロパティ操作は
-        // 中の実体である x264enc 要素そのものに対して行う必要がある。
         _videoEncoderHandle = (newVenc as Bin)?.GetByName("venc")?.Handle ?? IntPtr.Zero;
 
-        Console.WriteLine("[Config] x264enc recreated (linked, not yet playing)");
+        Console.WriteLine("[Config] video encoder recreated (linked, not yet playing)");
         return newVenc;
     }
 
@@ -1024,8 +1047,6 @@ internal sealed class WebRtcSession : IDisposable
         _videoDisabled = false;
         InputInjector.Enabled = true;
 
-        // 既にキャプチャ映像が選ばれている(モニター→モニター等)場合は、セレクタに触れない。
-        // 「映像なし」からの復帰時と、接続時テスト映像中のみ切り替える。
         if (!wasDisabled && !_burstActive) return;
 
         if (_videoSelectorHandle != IntPtr.Zero && _captureSelPad is not null)
@@ -1034,17 +1055,10 @@ internal sealed class WebRtcSession : IDisposable
         }
     }
 
-
     private static string BuildPipelineDescription(HostConfig config)
     {
         var videoSource = config.UseTestSource
             ? "videotestsrc name=capturesrc is-live=true pattern=ball !"
-            // capture-api=1 (WGC/Windows Graphics Capture) に固定しておくことで、
-            // モニター全体キャプチャ(monitor-index)とウィンドウキャプチャ(window-handle)を
-            // 実行中にプロパティ変更だけで切り替えられるようにする。
-            // (capture-api=0 の Desktop Duplication API はウィンドウ単位キャプチャ非対応)
-            // ※ プロパティ名/値は環境のGStreamerバージョンで `gst-inspect-1.0 d3d11screencapturesrc`
-            //    を実行し実際の名称と一致するか確認すること。
             : $"d3d11screencapturesrc name=capturesrc capture-api=1 monitor-index=0 show-cursor=true do-timestamp=true ! video/x-raw(memory:D3D11Memory),framerate={config.Framerate}/1 ! d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12 ! d3d11download !";
 
         var audioSource = config.UseTestSource
@@ -1052,19 +1066,10 @@ internal sealed class WebRtcSession : IDisposable
             : "wasapisrc name=audiosrc loopback=true low-latency=true !";
 
         var videoCapsAndPay = config.Codec == VideoCodec.Hevc
-            // H.265/HEVC: libx264/nvh264enc よりも効率的だが、WebRTCでのブラウザ対応は
-            // 限定的(2026年時点でも Chrome は非対応環境が多く、Safari の一部バージョンのみ
-            // 対応)。事前に受信側ブラウザの対応状況を確認してから使うこと。
             ? "rtph265pay name=vpay config-interval=-1 pt=96 aggregate-mode=zero-latency !"
             : "video/x-h264,profile=baseline ! rtph264pay name=vpay config-interval=-1 pt=96 aggregate-mode=zero-latency !";
 
-        // 接続直後の数百msだけ、動きのあるテスト映像(videotestsrc)に切り替える実験機能。
-        // input-selector でキャプチャ映像とテスト映像を切り替える。無効時は従来どおりの構成。
         var burst = config.StartupBurstMs > 0 && config.EnablePlayoutDelay && !config.UseTestSource;
-        // 映像の入力は input-selector 経由にし、キャプチャ映像 / 黒画面(「映像なし」用) /
-        // (実験機能)接続時テスト映像を切り替えられるようにする。
-        // cache-buffers=true: 切り戻し時に直前のフレームを再送し、静止画面でも
-        // 切り替え前の映像が残り続けないようにする。
         var useSelector = !config.UseTestSource;
         var videoHead = useSelector
             ? "input-selector name=vsel cache-buffers=true !"
@@ -1074,47 +1079,29 @@ internal sealed class WebRtcSession : IDisposable
         {
             $"webrtcbin name=sendrecv bundle-policy=max-bundle stun-server={config.StunServer}",
 
-            // 映像: プライマリモニタ(または切り替え後の対象)をキャプチャしてエンコードし RTP 化
-            // 各要素に名前を付け、エラー発生時に映像経路だけをまとめて NULL -> PLAYING で
-            // 再初期化できるようにしている。
             videoHead,
             "videoconvert name=vconv !",
             "videocrop name=vcrop !",
             "video/x-raw,format=I420 !",
-            // 1枚だと、キャプチャが一瞬2枚続けて届いた(WGC/ディスプレイ周期とのゆらぎ)だけで
-            // 1枚捨ててしまい、周期的な小さなコマ落ちの原因になる。2枚まで許容する。
             "queue name=vqueue1 max-size-buffers=2 leaky=downstream !",
             "videoconvert name=vconv2 !",
             BuildVideoEncoderDescription(config, config.BitrateKbps) + " !",
             videoCapsAndPay,
-            // queue のデフォルトは最大1秒分(max-size-time=1s)まで溜め込めるため、下流(webrtcbin)が
-            // 一時的に詰まった際に最大約1秒の遅延がそのまま残る恐れがある。上限を100msに絞る。
-            // ここは RTP パケット(エンコード済み)なので leaky にはしない(パケットを落とすと
-            // 映像が壊れる)。満杯になったら上流のエンコーダが待たされ、vqueue1(leaky)が
-            // 未エンコードのフレームを間引くため、遅延は溜まらず映像も壊れない。
-            // (max-size-buffers/bytes を 0 にして時間のみで制限。キーフレームは多数のパケットに
-            //  分割されるため、バッファ数で制限するとキーフレーム送出が不必要に詰まる)
             "queue name=vqueue2 max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 ! sendrecv.",
-
         };
 
         var audioTail = new[]
         {
-            // 1バッファ(10ms)だけだと、ほんの一瞬エンコーダ側が遅れただけで音声が欠け、
-            // 受信側で欠落補間/加速再生(ピッチ変化に聞こえる)が起きやすい。200msまで吸収する。
             "queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream !",
             "opusenc bitrate=64000 !",
             "rtpopuspay pt=97 !",
-            // 音声も同様に上限を100msに絞る。音声パケットは1つ落ちても一瞬のノイズで済むため leaky にする。
             "queue max-size-buffers=0 max-size-bytes=0 max-size-time=100000000 leaky=downstream ! sendrecv.",
         };
 
         if (useSelector)
         {
-            // 上のチェーン(vsel -> ... -> sendrecv.)へ入力を接続する。先に接続したものが最初の active-pad になる。
             if (burst)
             {
-                // テスト映像を先(最初の入力)にして「最初からテスト映像」で始める。
                 var rect = ScreenGeometry.GetMonitorRect(0) ?? ScreenGeometry.PrimaryMonitorFallback;
                 var bw = rect.Width - rect.Width % 2;
                 var bh = rect.Height - rect.Height % 2;
@@ -1123,13 +1110,11 @@ internal sealed class WebRtcSession : IDisposable
 
             parts.Add(videoSource.Replace("d3d11download !", "d3d11download name=capdl ! vsel."));
 
-            // 「映像なし」用の黒画面(低解像度・低負荷)。
             parts.Add($"videotestsrc name=blacksrc is-live=true pattern=black ! capsfilter name=blackcaps caps=\"video/x-raw,format=NV12,width=640,height=360,framerate={Math.Max(config.Framerate, 1)}/1\" ! vsel.");
         }
 
         if (burst)
         {
-            // ---- 音声 ---- (テスト音 → 実音声。どちらも同一フォーマットに揃えてから input-selector へ)
             parts.Add("input-selector name=asel ! volume name=vol !");
             parts.AddRange(audioTail);
             parts.Add("audiotestsrc name=atestsrc is-live=true wave=sine volume=0.02 ! audioconvert ! audioresample ! capsfilter name=atestcaps caps=\"audio/x-raw,format=S16LE,rate=48000,channels=2\" ! asel.");
@@ -1138,8 +1123,6 @@ internal sealed class WebRtcSession : IDisposable
         }
         else
         {
-            // 音声: 既定の再生デバイスをループバックキャプチャして Opus でエンコードし RTP 化
-            // volume 要素でミュート/音量を制御できるようにする。
             parts.Add(audioSource);
             parts.Add("audioconvert ! audioresample !");
             parts.Add("volume name=vol !");
@@ -1161,19 +1144,10 @@ internal sealed class WebRtcSession : IDisposable
     /// </summary>
     private static string BuildVideoEncoderDescription(HostConfig config, uint bitrateKbps)
     {
-        // NVIDIA GPU (NVENC) 前提。GPUが無い環境では x264enc 等への差し替えが必要
-        // (ただし x264enc は失敗後の再初期化が不安定なことが実機で確認されている点に注意)。
         return config.Codec == VideoCodec.Hevc
             ? $"nvh265enc name=venc bitrate={bitrateKbps} zerolatency=true rc-mode=cbr preset=low-latency-hq"
             : $"nvh264enc name=venc bitrate={bitrateKbps} zerolatency=true rc-mode=cbr preset=low-latency-hq";
     }
-
-    // ---- webrtcbin コールバック --------------------------------------------------
-
-    // NOTE: これらのメソッドは全てネイティブコード(GLibシグナル/リバースP/Invoke)から
-    // 直接呼び出される。ここで例外を外に漏らすと、.NETはマネージド例外をネイティブの
-    // 呼び出しスタックへ安全に unwind できず、プロセスが「エラーメッセージなしに」
-    // 即座に終了する。そのため全ての本体を try/catch で確実に囲むこと。
 
     private void OnNegotiationNeeded(IntPtr webrtcbin, IntPtr userData)
     {
@@ -1205,8 +1179,6 @@ internal sealed class WebRtcSession : IDisposable
             var sdpText = GstNativeInterop.SessionDescriptionToSdpText(offerDescPtr);
             Console.WriteLine("[WebRTC] Offer SDP:\n" + sdpText);
 
-            // 低遅延モード: ブラウザへ送る SDP テキストにだけ playout-delay の extmap を追加する
-            // (webrtcbin 側のローカル記述は無変更)。詳細は PlayoutDelayExtension.cs 参照。
             if (_config.EnablePlayoutDelay)
             {
                 var munged = PlayoutDelayExtension.AddExtmapToOffer(sdpText, out var offeredId);
@@ -1222,8 +1194,6 @@ internal sealed class WebRtcSession : IDisposable
                 }
             }
 
-            // ここでの offerDescPtr は g_value_dup_boxed() で複製した「自分の所有物」なので、
-            // 公式サンプルと同じく emit -> interrupt -> unref -> free の同期パターンでよい。
             var localPromise = GstNativeInterop.PromiseNew();
             GstNativeInterop.EmitSetLocalDescription(_webrtcHandle, offerDescPtr, localPromise);
             GstNativeInterop.gst_promise_interrupt(localPromise);
@@ -1287,8 +1257,6 @@ internal sealed class WebRtcSession : IDisposable
                 _captureHeight = height;
                 var cropRight = width % 2 != 0 ? 1 : 0;
 
-                // top を既にタイトルバー除去用にクロップしている場合、その分を差し引いた
-                // 「最終的な出力の高さ」が偶数になるよう bottom を調整する必要がある。
                 var heightAfterTopCrop = height - _videoCropTopPixels;
                 var cropBottom = heightAfterTopCrop % 2 != 0 ? 1 : 0;
 
@@ -1321,8 +1289,6 @@ internal sealed class WebRtcSession : IDisposable
                     var srcName = (msg.Src as Element)?.Name ?? "(unknown)";
                     Console.WriteLine($"[Pipeline] ERROR from '{srcName}': {err.Message} ({debug})");
 
-                    // 映像経路(capturesrc/vqueue1/venc/vpay/vqueue2)由来のエラーのみ、
-                    // 自動復旧の対象にする。webrtcbin 自体のエラー等はここでは扱わない。
                     if (srcName is "capturesrc" or "vqueue1" or "venc" or "vpay" or "vqueue2")
                     {
                         RecoverVideoBranch();
@@ -1342,8 +1308,6 @@ internal sealed class WebRtcSession : IDisposable
             Console.WriteLine($"[Pipeline][FATAL in OnBusMessage] {ex}");
         }
     }
-
-    // ---- ブラウザからのシグナリングメッセージ処理 --------------------------------
 
     private void OnSignalingMessage(string json)
     {
@@ -1386,7 +1350,6 @@ internal sealed class WebRtcSession : IDisposable
     {
         if (_config.EnablePlayoutDelay && _offeredPlayoutExtId > 0)
         {
-            // webrtcbin は未知の拡張を扱えないので、アンサーから該当行を取り除いて渡す
             sdpText = PlayoutDelayExtension.StripExtmapFromAnswer(sdpText, out var answeredId);
             if (answeredId > 0 && _videoPayloaderElement is not null)
             {
@@ -1403,8 +1366,6 @@ internal sealed class WebRtcSession : IDisposable
         var answerDescPtr = GstNativeInterop.WebRtcSessionDescriptionNew(
             GstNativeInterop.WebRTCSDPType.Answer, sdpMessagePtr);
 
-        // answerDescPtr はこちらで gst_webrtc_session_description_new() により新規生成した
-        // 自分の所有物なので、公式サンプルと同じ同期パターンで解放してよい。
         var promise = GstNativeInterop.PromiseNew();
         GstNativeInterop.EmitSetRemoteDescription(_webrtcHandle, answerDescPtr, promise);
         GstNativeInterop.gst_promise_interrupt(promise);
@@ -1418,11 +1379,9 @@ internal sealed class WebRtcSession : IDisposable
 
     public void Dispose()
     {
-        // 引き継ぎ(takeover)と Disconnected の両方から呼ばれうるので、二重実行を防ぐ
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        // 先にタイマーを止め、以降ウィンドウ状態を触らせないようにしてから元に戻す
-        // (戻した直後にタイマーがタイトルバーを再度外す、といった競合を防ぐ)。
         _resizeWatchTimer?.Dispose();
+        _controlWork.CompleteAdding();
         lock (_windowLock)
         {
             _windowStateDisposed = true;

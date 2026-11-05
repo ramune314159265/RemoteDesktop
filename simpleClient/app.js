@@ -12,7 +12,6 @@ const logEl = document.getElementById("log");
 
 wsUrlInput.value = localStorage.getItem('ramune314159265.remotesimpleclient.lasturl') ?? `ws://${location.hostname}:8787/signaling`
 
-// 接続時テスト音声/映像が流れている間 true。終了通知(burstEnd)を受けるまで video をミュートにする。
 let burstPending = false;
 
 let ws = null;
@@ -49,13 +48,9 @@ function createPeerConnection() {
       if ("jitterBufferTarget" in event.receiver) {
         event.receiver.jitterBufferTarget = 0;
       }
-    } catch {
-      /* 対応していないブラウザでは無視 */
-    }
+    } catch { }
   };
 
-  // マウス/キーボード制御用 DataChannel はホスト側(Offerer)が作成するため、
-  // ブラウザ側は createDataChannel を呼ばず ondatachannel で受け取るだけでよい。
   peer.ondatachannel = (event) => {
     controlChannel = event.channel;
     controlChannel.onopen = () => {
@@ -128,7 +123,6 @@ function connect() {
   const separator = baseUrl.includes("?") ? "&" : "?";
   const url = `${baseUrl}${separator}fps=${fps}&codec=${encodeURIComponent(codec)}&playout=${playoutCheck.checked ? 1 : 0}&bitrate=${parseInt(bitrateInput.value, 10) || 6000}&burst=${parseInt(burstInput.value, 10) || 0}`;
 
-  // 接続時テスト映像(低遅延モードがオンのときのみ有効)が終わるまで、video をミュートにしておく
   burstPending = playoutCheck.checked && (parseInt(burstInput.value, 10) || 0) > 0;
   updateVideoMuted();
 
@@ -188,7 +182,7 @@ function disconnect() {
 }
 
 videoEl.addEventListener("loadedmetadata", updateVideoAspectRatio);
-videoEl.addEventListener("resize", updateVideoAspectRatio); // 配信中に解像度が変わった場合にも追従
+videoEl.addEventListener("resize", updateVideoAspectRatio);
 
 function updateVideoAspectRatio() {
   log(`Video size: ${videoEl.videoWidth}x${videoEl.videoHeight}`)
@@ -196,12 +190,6 @@ function updateVideoAspectRatio() {
     videoEl.style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
   }
 }
-
-// ---------------------------------------------------------------------------
-// ウィンドウ配信時、ホスト側ウィンドウをこちらの video 要素サイズに合わせて
-// リサイズしてもらうため、実際の描画サイズ(devicePixelRatio考慮)を通知する。
-// レイアウト変更のたびに送ると負荷が高いので 1 秒 debounce する。
-// ---------------------------------------------------------------------------
 
 let viewportDebounceTimer = null;
 
@@ -211,13 +199,6 @@ function scheduleSendViewportSize() {
 }
 
 function sendViewportSize() {
-  // ここで送るサイズは、ホスト側で「配信されるクライアント領域(映像そのもの)の
-  // 目標サイズ」としてそのまま適用される(サーバー側でアスペクト比の再計算は
-  // 行わない)。フルスクリーンレイアウトでは video 要素自体は常に画面いっぱいの
-  // サイズになり(object-fit:contain で内部だけアスペクト比を保持)、
-  // getBoundingClientRect() をそのまま使うと黒帯を含めた画面全体のサイズを
-  // 送ってしまい、配信中のウィンドウのアスペクト比と食い違って固まる原因になる。
-  // 黒帯を除いた実際の映像表示範囲(getVideoContentRect)を使う。
   const rect = getVideoContentRect();
   const dpr = window.devicePixelRatio || 1;
   const width = Math.round(rect.width * dpr);
@@ -227,13 +208,6 @@ function sendViewportSize() {
   }
 }
 
-// 黒帯(レターボックス)側だけがわずかに変化した場合、映像自体のサイズは
-// 実質変わっていなくても getVideoContentRect() の再計算で ±1px 程度の誤差
-// (丸め誤差により奇数/偶数が入れ替わる等)が生じることがある。これをそのまま
-// setViewportSize として送ると、サーバー側で「本物のリサイズ」として扱われ
-// ホスト側ウィンドウの再作成(WGCセッションの再初期化)が走ってしまい、
-// 実害のない揺らぎのはずが配信のフリーズを引き起こすことが実機で確認された。
-// そのため、直前に送った値から一定の誤差範囲内の変化は送らないようにする。
 const VIEWPORT_SIZE_TOLERANCE_PX = 2;
 let lastSentViewportSize = null;
 
@@ -283,14 +257,6 @@ function computeFitSize(maxWidth, maxHeight, aspectW, aspectH) {
 connectBtn.addEventListener("click", connect);
 disconnectBtn.addEventListener("click", disconnect);
 
-// ---------------------------------------------------------------------------
-// マウス/キーボード入力の送信(最低限実装)
-//
-// - マウスは今のところ「ダイレクトカーソル(絶対座標)」モードのみ。
-//   タッチ/トラックパッド風モードの切り替えUIはリッチなフロントエンド側で実装予定。
-// - キーボードは video 要素にフォーカスがある間だけ送信する。
-// ---------------------------------------------------------------------------
-
 function sendControl(msg) {
   if (controlChannel && controlChannel.readyState === "open") {
     controlChannel.send(JSON.stringify(msg));
@@ -317,7 +283,6 @@ function getVideoContentRect() {
   const videoH = videoEl.videoHeight;
 
   if (!videoW || !videoH) {
-    // メタデータ未取得時はボックスそのものを返す(黒帯考慮なし)
     return rect;
   }
 
@@ -326,11 +291,9 @@ function getVideoContentRect() {
 
   let contentWidth, contentHeight;
   if (boxRatio > videoRatio) {
-    // ボックスの方が横長 -> 左右にピラーボックス(黒帯)
     contentHeight = rect.height;
     contentWidth = rect.height * videoRatio;
   } else {
-    // ボックスの方が縦長 -> 上下にレターボックス(黒帯)
     contentWidth = rect.width;
     contentHeight = rect.width / videoRatio;
   }
@@ -346,7 +309,7 @@ function getVideoContentRect() {
   };
 }
 
-videoEl.tabIndex = 0; // キーボードイベントを受け取れるようにする
+videoEl.tabIndex = 0;
 videoEl.addEventListener("click", () => videoEl.focus());
 videoEl.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -385,14 +348,6 @@ videoEl.addEventListener("keyup", (e) => {
   e.preventDefault();
   sendControl({ type: "keyUp", code: e.code });
 });
-
-// ---------------------------------------------------------------------------
-// タッチ操作(マルチタッチ対応)
-// ホスト側は InjectSyntheticPointerInput で複数点同時のタッチ注入に対応している。
-// ネイティブのタッチイベント1回ごとに、そのイベントで変化した指(changedTouches)
-// をまとめて1つの type:"touch" メッセージとして送る。ホスト側で現在アクティブな
-// 全タッチの状態を組み立て直すため、ここでは「変化した点」だけを送ればよい。
-// ---------------------------------------------------------------------------
 
 function touchListToDtos(touchList, phase) {
   const rect = getVideoContentRect();
@@ -470,10 +425,6 @@ videoEl.addEventListener(
   { passive: false }
 );
 
-// ---------------------------------------------------------------------------
-// ミュート・ビットレート変更・配信元切り替え(動作確認用の最低限UI)
-// ---------------------------------------------------------------------------
-
 const openBtn = document.getElementById("openBtn");
 const closeBtn = document.getElementById("closeBtn");
 const bitrateInput = document.getElementById("bitrateInput");
@@ -497,7 +448,6 @@ muteCheckbox.addEventListener("change", () => {
   updateVideoMuted();
 });
 
-// video の再生ミュート: テスト映像の間、またはミュートのチェックが入っている間はミュートにする
 function updateVideoMuted() {
   videoEl.muted = burstPending || muteCheckbox.checked;
 }
@@ -506,11 +456,10 @@ listSourcesBtn.addEventListener("click", () => {
   sendControl({ type: "listSources" });
 });
 
-// 選択肢の value: "monitor:<番号>" / "window:<ハンドル>" / "none"(映像なし=音声のみ)
 switchSourceBtn.addEventListener("click", () => {
   const value = sourceSelect.value;
   if (!value) return;
-  lastSentViewportSize = null; // 別ソースへの切替なので直前値による抑制をリセットする
+  lastSentViewportSize = null;
 
   if (value === "none") {
     log("Switching to no-video (audio only)");
@@ -539,10 +488,6 @@ function addOptionGroup(label, items) {
   sourceSelect.appendChild(group);
 }
 
-// ---------------------------------------------------------------------------
-// 全画面表示 / スクリーンショット
-// ---------------------------------------------------------------------------
-
 function fullscreenElement() {
   return document.fullscreenElement ?? document.webkitFullscreenElement ?? null;
 }
@@ -558,7 +503,6 @@ fullscreenBtn.addEventListener("click", () => {
     log("このブラウザは全画面表示に対応していません");
     return;
   }
-  // 新旧どちらの実装でも Promise が返る/返らないに対応
   Promise.resolve(request.call(target)).catch((err) => log("全画面表示に失敗:", err.message ?? err));
 });
 
@@ -619,10 +563,6 @@ function handleControlChannelMessage(data) {
     log("Source error:", msg.message);
     alert(msg.message);
   } else if (msg.type === "windowResized") {
-    // ホスト側ウィンドウが自発的に(こちらの意図とは無関係に)新しいサイズになった。
-    // 現在のレイアウトで使える表示領域に、通知された新しいアスペクト比を
-    // contain でフィットさせたサイズを計算し、希望サイズとして送り返す。
-    // サーバーはこれを受けてウィンドウをリサイズし、配信もそれに追従する。
     log(`Host window resized independently: ${msg.width}x${msg.height}`);
     const box = getAvailableBoxSizePx();
     const target = computeFitSize(box.width, box.height, msg.width, msg.height);
@@ -641,29 +581,11 @@ closeBtn.addEventListener('click', () => {
   document.querySelector('.side').classList.add('closing')
 })
 
-// ---------------------------------------------------------------------------
-// バックグラウンド再生
-// タブが非表示(他タブ切替・画面ロック・最小化等)になるとブラウザが video の
-// デコード/描画を止めたり一時停止したりすることがある。WebRTC の受信自体は
-// バックグラウンドでも継続するため、明示的に再生を再開させておく。
-// ---------------------------------------------------------------------------
-
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
     videoEl.play().catch((err) => log("Background play failed:", err.message ?? err));
   }
 });
-
-// ---------------------------------------------------------------------------
-// フリーズ検知と自動復旧
-//
-// リサイズ直後などに映像が固まって進まなくなることがある(Safari 等、ブラウザの
-// WebRTC 実装がストリームの解像度変化に伴うレンダラの再初期化をうまく処理できて
-// いない可能性がある)。サーバー側からはクライアントの描画が固まっているかは
-// 分からないため、クライアント側で videoEl.currentTime の進行を監視し、
-// 一定時間止まっていたら MediaStream を videoEl から一旦外して再アタッチする
-// ことでレンダラの再初期化を促す。
-// ---------------------------------------------------------------------------
 
 const FREEZE_CHECK_INTERVAL_MS = 1000;
 const FREEZE_THRESHOLD_MS = 4000;
@@ -693,8 +615,6 @@ function recoverFrozenVideo() {
   freezeRecoveryInProgress = true;
   const stream = videoEl.srcObject;
 
-  // MediaStream を一旦外して再アタッチすることで、ブラウザ側のレンダラを
-  // 強制的に再初期化させる。接続自体(RTCPeerConnection)には触れない。
   videoEl.srcObject = null;
 
   requestAnimationFrame(() => {
@@ -703,7 +623,6 @@ function recoverFrozenVideo() {
       .play()
       .catch((err) => log("Freeze recovery play failed:", err.message ?? err));
 
-    // 復旧直後はまだ currentTime が動いていないため、判定を一旦リセットする。
     lastVideoTime = videoEl.currentTime;
     lastVideoProgressAt = Date.now();
 

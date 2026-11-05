@@ -93,8 +93,6 @@ internal static class WindowEnumerator
     {
         var result = new List<WindowInfo>();
 
-        // EnumWindows はこのメソッド呼び出し中に同期的にコールバックを呼ぶため、
-        // ローカル変数として保持しているだけでGCに回収される心配はない。
         bool Callback(IntPtr hWnd, IntPtr _)
         {
             if (!IsTaskbarWindow(hWnd)) return true;

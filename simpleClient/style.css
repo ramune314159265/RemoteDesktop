@@ -123,9 +123,6 @@ video {
   outline: none;
   cursor: none;
   touch-action: none;
-  /* aspect-ratio は app.js の loadedmetadata/resize イベントで動的に設定する。
-     これにより配信解像度と表示ボックスの比率が一致し、レターボックス/ピラーボックス
-     (黒帯)が発生しなくなる。 */
   object-fit: contain;
 }
 
