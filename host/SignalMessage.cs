@@ -13,6 +13,9 @@ internal sealed class SignalMessage
     [JsonPropertyName("candidate")]
     public string? Candidate { get; set; }
 
+    [JsonPropertyName("token")]
+    public string? Token { get; set; }
+
     [JsonPropertyName("sdpMLineIndex")]
     public uint? SdpMLineIndex { get; set; }
 }

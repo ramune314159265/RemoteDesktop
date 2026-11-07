@@ -239,7 +239,7 @@ internal sealed class SignalingServer
         using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
         var queryString = ctx.Request.QueryString.Value;
         var queryParams = ParseQuery(queryString);
-        var client = new SignalingClient(socket, queryParams);
+        var client = new SignalingClient(socket, queryParams, ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown", ctx.Request.Headers.UserAgent.ToString());
         var scheme = ctx.Request.IsHttps ? "wss" : "ws";
         Console.WriteLine($"[Signaling] Client connected via {scheme}" + (queryParams.Count > 0 ? $" (query: {queryString})" : ""));
         ClientConnected?.Invoke(client);
@@ -289,9 +289,15 @@ internal sealed class SignalingClient
     /// <summary>接続URLのクエリパラメータ(例: ?fps=60&amp;codec=hevc)。</summary>
     public IReadOnlyDictionary<string, string> QueryParams { get; }
 
-    public SignalingClient(WebSocket socket, IReadOnlyDictionary<string, string>? queryParams = null)
+    public string RemoteAddress { get; }
+
+    public string UserAgent { get; }
+
+    public SignalingClient(WebSocket socket, IReadOnlyDictionary<string, string>? queryParams = null, string remoteAddress = "unknown", string userAgent = "")
     {
         _socket = socket;
+        RemoteAddress = remoteAddress;
+        UserAgent = userAgent;
         QueryParams = queryParams ?? new Dictionary<string, string>();
     }
 

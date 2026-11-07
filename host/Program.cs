@@ -13,6 +13,11 @@ internal static class Program
 
     private static async Task<int> Main(string[] args)
     {
+        if (Microsoft.Toolkit.Uwp.Notifications.ToastNotificationManagerCompat.WasCurrentProcessToastActivated())
+        {
+            return 0;
+        }
+
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
             Console.WriteLine("[FATAL] AppDomain UnhandledException:");
@@ -100,7 +105,15 @@ internal static class Program
         var sessionLock = new object();
         var server = new SignalingServer(prefix, wssOptions);
 
-        server.ClientConnected = client =>
+        var authorizer = new DeviceAuthorizer(Path.Combine(AppContext.BaseDirectory, "authorized_devices.json"));
+        if (wssPort <= 0)
+        {
+            Console.WriteLine("[Auth] 警告: wss が無効です。ws:// のままだと認証トークンが暗号化されずに流れます。--wss-port の指定を推奨します。");
+        }
+
+        server.ClientConnected = client => authorizer.Attach(client, () => StartSession(client));
+
+        void StartSession(SignalingClient client)
         {
             lock (sessionLock)
             {
@@ -168,7 +181,7 @@ internal static class Program
                     if (ReferenceEquals(currentSession, session)) currentSession = null;
                 }
             }
-        };
+        }
 
         void DisposeActiveSession()
         {

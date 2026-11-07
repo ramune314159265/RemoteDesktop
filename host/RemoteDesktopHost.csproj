@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net8.0-windows10.0.17763.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- webrtcbin / d3d11screencapturesrc / wasapisrc は Windows x64 前提 -->
@@ -26,6 +26,7 @@
       直接 P/Invoke して制御する。
     -->
     <PackageReference Include="GstSharpBundle" Version="1.24.3-preview6" />
+    <PackageReference Include="Microsoft.Toolkit.Uwp.Notifications" Version="7.1.3" />
   </ItemGroup>
 
 </Project>

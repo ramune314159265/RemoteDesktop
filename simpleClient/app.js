@@ -91,8 +91,49 @@ function sendMessage(obj) {
   }
 }
 
+function authTokenKey(url) {
+  try {
+    return `ramune314159265.remotesimpleclient.token.${new URL(url).host}`;
+  } catch {
+    return `ramune314159265.remotesimpleclient.token.${url}`;
+  }
+}
+
+function loadAuthToken(url) {
+  try {
+    return localStorage.getItem(authTokenKey(url));
+  } catch {
+    return null;
+  }
+}
+
+function saveAuthToken(url, token) {
+  try {
+    localStorage.setItem(authTokenKey(url), token);
+  } catch { }
+}
+
+const authDeniedMessages = {
+  denied: "ホストで拒否されました",
+  busy: "ホストが別の端末の承認待ちです。しばらくしてからやり直してください",
+  locked: "拒否が続いたため、しばらく接続できません",
+};
+
 async function handleSignalingMessage(msg) {
-  if (msg.type === "offer") {
+  if (msg.type === "authPending") {
+    log("Waiting for approval on the host");
+    setStatus("ホストの承認待ち...", "connecting");
+  } else if (msg.type === "authOk") {
+    if (msg.token) {
+      saveAuthToken(wsUrlInput.value.trim(), msg.token);
+      log("Device approved, token saved");
+    }
+    setStatus("接続中...", "connecting");
+  } else if (msg.type === "authDenied") {
+    authDeniedReason = authDeniedMessages[msg.reason] ?? "認証に失敗しました";
+    log("Authentication failed:", authDeniedReason);
+    setStatus(authDeniedReason, "error");
+  } else if (msg.type === "offer") {
     log("Offer received");
     await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
     const answer = await pc.createAnswer();
@@ -113,6 +154,8 @@ async function handleSignalingMessage(msg) {
   }
 }
 
+let authDeniedReason = null;
+
 function connect() {
   const baseUrl = wsUrlInput.value.trim();
   if (!baseUrl) return;
@@ -131,8 +174,11 @@ function connect() {
 
   ws = new WebSocket(url);
 
+  authDeniedReason = null;
+
   ws.onopen = () => {
     log("Signaling connected:", url);
+    sendMessage({ type: "auth", token: loadAuthToken(baseUrl) });
   };
 
   ws.onmessage = (event) => {
@@ -152,8 +198,10 @@ function connect() {
 
   ws.onclose = () => {
     log("Signaling closed");
-    setStatus("未接続", "idle");
+    if (!authDeniedReason) setStatus("未接続", "idle");
     cleanupPeer();
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
   };
 
   connectBtn.disabled = true;
