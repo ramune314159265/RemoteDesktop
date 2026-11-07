@@ -11,11 +11,42 @@ internal static class Program
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
 
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool FreeConsole();
+
+    /// <summary>コンソールから切り離し、ログ出力を実行ファイルと同じフォルダの host.log へ向ける。</summary>
+    private static void RunInBackground()
+    {
+        try
+        {
+            var logPath = System.IO.Path.Combine(AppContext.BaseDirectory, "host.log");
+            if (System.IO.File.Exists(logPath) && new System.IO.FileInfo(logPath).Length > 5 * 1024 * 1024)
+            {
+                System.IO.File.Delete(logPath);
+            }
+            var stream = new System.IO.FileStream(logPath, System.IO.FileMode.Append, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite);
+            var writer = System.IO.TextWriter.Synchronized(new System.IO.StreamWriter(stream) { AutoFlush = true });
+            Console.SetOut(writer);
+            Console.SetError(writer);
+        }
+        catch
+        {
+            Console.SetOut(System.IO.TextWriter.Null);
+            Console.SetError(System.IO.TextWriter.Null);
+        }
+        FreeConsole();
+    }
+
     private static async Task<int> Main(string[] args)
     {
         if (Microsoft.Toolkit.Uwp.Notifications.ToastNotificationManagerCompat.WasCurrentProcessToastActivated())
         {
             return 0;
+        }
+
+        if (Array.IndexOf(args, "--noconsole") >= 0)
+        {
+            RunInBackground();
         }
 
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
