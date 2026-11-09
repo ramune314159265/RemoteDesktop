@@ -209,6 +209,7 @@ function connect() {
 }
 
 function cleanupPeer() {
+  stopRapidClick();
   burstPending = false;
   if (pc) {
     pc.close();
@@ -247,10 +248,10 @@ function scheduleSendViewportSize() {
 }
 
 function sendViewportSize() {
-  const rect = getVideoContentRect();
+  const { cw, ch } = getVideoLayout();
   const dpr = window.devicePixelRatio || 1;
-  const width = Math.round(rect.width * dpr);
-  const height = Math.round(rect.height * dpr);
+  const width = Math.round(cw * dpr);
+  const height = Math.round(ch * dpr);
   if (width > 0 && height > 0) {
     sendViewportSizeIfChanged(width, height);
   }
@@ -284,10 +285,9 @@ function getAvailableBoxSizePx() {
   const dpr = window.devicePixelRatio || 1;
   const containerWidthCss = videoEl.parentElement?.clientWidth ?? videoEl.clientWidth;
   const maxHeightCss = videoEl.parentElement?.clientHeight ?? videoEl.clientHeight;
-  return {
-    width: Math.round(containerWidthCss * dpr),
-    height: Math.round(maxHeightCss * dpr),
-  };
+  const width = Math.round(containerWidthCss * dpr);
+  const height = Math.round(maxHeightCss * dpr);
+  return rotated ? { width: height, height: width } : { width, height };
 }
 
 /** 指定したアスペクト比(aspectW:aspectH)を、maxWidth x maxHeight の箱に contain でフィットさせる。 */
@@ -318,64 +318,132 @@ function buttonName(button) {
   return "left";
 }
 
+let rotated = false;
+
 /**
- * <video> 要素の実際の描画ボックス(rect)は、動画の実解像度とアスペクト比が
- * 異なる場合、レターボックス(上下黒帯) or ピラーボックス(左右黒帯)を含む。
- * 黒帯部分を含めて正規化座標を計算すると、縦長/横長になるほど誤差が大きくなる
- * (実際に報告された症状)。videoWidth/videoHeight(動画の実解像度)を使って、
- * 黒帯を除いた「実際に映像が描画されている矩形」を計算する。
+ * <video> 要素の描画ボックスのうち、映像そのものが描画されている範囲(黒帯を除く)を求める。
+ * cw/ch は映像自身の向き(回転前)での幅と高さ。回転中は要素のバウンディングボックスの縦横が入れ替わる。
  */
-function getVideoContentRect() {
+function getVideoLayout() {
   const rect = videoEl.getBoundingClientRect();
-  const videoW = videoEl.videoWidth;
-  const videoH = videoEl.videoHeight;
+  const elW = rotated ? rect.height : rect.width;
+  const elH = rotated ? rect.width : rect.height;
+  let cw = elW;
+  let ch = elH;
 
-  if (!videoW || !videoH) {
-    return rect;
+  if (videoEl.videoWidth && videoEl.videoHeight) {
+    const videoRatio = videoEl.videoWidth / videoEl.videoHeight;
+    if (elW / elH > videoRatio) {
+      ch = elH;
+      cw = elH * videoRatio;
+    } else {
+      cw = elW;
+      ch = elW / videoRatio;
+    }
   }
+  return { rect, cw, ch };
+}
 
-  const videoRatio = videoW / videoH;
-  const boxRatio = rect.width / rect.height;
-
-  let contentWidth, contentHeight;
-  if (boxRatio > videoRatio) {
-    contentHeight = rect.height;
-    contentWidth = rect.height * videoRatio;
-  } else {
-    contentWidth = rect.width;
-    contentHeight = rect.width / videoRatio;
-  }
-
-  const offsetX = (rect.width - contentWidth) / 2;
-  const offsetY = (rect.height - contentHeight) / 2;
-
-  return {
-    left: rect.left + offsetX,
-    top: rect.top + offsetY,
-    width: contentWidth,
-    height: contentHeight,
-  };
+/**
+ * 画面上の座標を、映像自身の向きでの正規化座標(0〜1)へ変換する。
+ * 90度(時計回り)回転中は、見た目の下方向が映像の右方向になる。
+ */
+function clientToVideoPoint(clientX, clientY) {
+  const { rect, cw, ch } = getVideoLayout();
+  const dx = clientX - (rect.left + rect.width / 2);
+  const dy = clientY - (rect.top + rect.height / 2);
+  const u = rotated ? dy : dx;
+  const v = rotated ? -dx : dy;
+  return { x: (u + cw / 2) / cw, y: (v + ch / 2) / ch };
 }
 
 videoEl.tabIndex = 0;
 videoEl.addEventListener("click", () => videoEl.focus());
 videoEl.addEventListener("contextmenu", (e) => e.preventDefault());
 
+const RAPID_CLICK_INTERVAL_MS = 50;
+const MOUSE_TOUCH_ID = 1000;
+
+function clamp01(value) {
+  return Math.max(Math.min(value, 1), 0);
+}
+
+/** 入力元(mouse / touch)と入力モードの設定から、実際に使う入力方式(mouse / touch / rapid)を決める。 */
+function resolveInputMode(source) {
+  const mode = inputSelect.value;
+  if (mode === "auto") return source === "touch" ? "touch" : "mouse";
+  return mode;
+}
+
+function videoPointClamped(clientX, clientY) {
+  const point = clientToVideoPoint(clientX, clientY);
+  return { x: clamp01(point.x), y: clamp01(point.y) };
+}
+
+let rapidTimer = null;
+
+function startRapidClick(button) {
+  stopRapidClick();
+  const click = () => {
+    sendControl({ type: "mouseButton", button, action: "down" });
+    sendControl({ type: "mouseButton", button, action: "up" });
+  };
+  click();
+  rapidTimer = setInterval(click, RAPID_CLICK_INTERVAL_MS);
+}
+
+function stopRapidClick() {
+  if (rapidTimer !== null) {
+    clearInterval(rapidTimer);
+    rapidTimer = null;
+  }
+}
+
+window.addEventListener("blur", stopRapidClick);
+
+let mousePressMode = null;
+
 videoEl.addEventListener("mousemove", (e) => {
-  const rect = getVideoContentRect();
-  const x = (e.clientX - rect.left) / rect.width;
-  const y = (e.clientY - rect.top) / rect.height;
-  if (x < 0 || x > 1 || y < 0 || y > 1) return;
-  sendControl({ type: "mouseMove", mode: "absolute", x, y });
+  const raw = clientToVideoPoint(e.clientX, e.clientY);
+  if (raw.x < 0 || raw.x > 1 || raw.y < 0 || raw.y > 1) return;
+
+  const mode = mousePressMode ?? resolveInputMode("mouse");
+  if (mode === "touch") {
+    if (mousePressMode === "touch") {
+      sendControl({ type: "touch", touches: [{ id: MOUSE_TOUCH_ID, x: raw.x, y: raw.y, phase: "move" }] });
+    }
+    return;
+  }
+  sendControl({ type: "mouseMove", mode: "absolute", x: raw.x, y: raw.y });
 });
 
 videoEl.addEventListener("mousedown", (e) => {
   e.preventDefault();
-  sendControl({ type: "mouseButton", button: buttonName(e.button), action: "down" });
+  const mode = resolveInputMode("mouse");
+  mousePressMode = mode;
+
+  if (mode === "touch") {
+    const point = videoPointClamped(e.clientX, e.clientY);
+    sendControl({ type: "touch", touches: [{ id: MOUSE_TOUCH_ID, x: point.x, y: point.y, phase: "down" }] });
+  } else if (mode === "rapid") {
+    startRapidClick(buttonName(e.button));
+  } else {
+    sendControl({ type: "mouseButton", button: buttonName(e.button), action: "down" });
+  }
 });
 
 videoEl.addEventListener("mouseup", (e) => {
-  sendControl({ type: "mouseButton", button: buttonName(e.button), action: "up" });
+  const mode = mousePressMode ?? resolveInputMode("mouse");
+  mousePressMode = null;
+
+  if (mode === "touch") {
+    const point = videoPointClamped(e.clientX, e.clientY);
+    sendControl({ type: "touch", touches: [{ id: MOUSE_TOUCH_ID, x: point.x, y: point.y, phase: "up" }] });
+  } else if (mode === "rapid") {
+    stopRapidClick();
+  } else {
+    sendControl({ type: "mouseButton", button: buttonName(e.button), action: "up" });
+  }
 });
 
 videoEl.addEventListener(
@@ -398,12 +466,10 @@ videoEl.addEventListener("keyup", (e) => {
 });
 
 function touchListToDtos(touchList, phase) {
-  const rect = getVideoContentRect();
   const dtos = [];
   for (const touch of touchList) {
-    const x = Math.max(Math.min((touch.clientX - rect.left) / rect.width, 1), 0);
-    const y = Math.max(Math.min((touch.clientY - rect.top) / rect.height, 1), 0);
-    dtos.push({ id: touch.identifier, x, y, phase });
+    const point = videoPointClamped(touch.clientX, touch.clientY);
+    dtos.push({ id: touch.identifier, x: point.x, y: point.y, phase });
   }
   return dtos;
 }
@@ -414,19 +480,34 @@ function sendTouchBatch(touchList, phase) {
   sendControl({ type: "touch", touches });
 }
 
+function sendMouseMoveFromTouch(touch) {
+  const point = videoPointClamped(touch.clientX, touch.clientY);
+  sendControl({ type: "mouseMove", mode: "absolute", x: point.x, y: point.y });
+}
+
+let touchPressMode = null;
+
 videoEl.addEventListener(
   "touchstart",
   (e) => {
     e.preventDefault();
-    if (inputSelect.value === 'mouse') {
-      const rect = getVideoContentRect();
-      const x = Math.max(Math.min((e.changedTouches[0].clientX - rect.left) / rect.width, 1), 0);
-      const y = Math.max(Math.min((e.changedTouches[0].clientY - rect.top) / rect.height, 1), 0);
-      sendControl({ type: "mouseMove", mode: "absolute", x, y });
-      sendControl({ type: "mouseButton", button: "left", action: "down" });
-      return
+    const mode = e.touches.length === e.changedTouches.length || touchPressMode === null
+      ? resolveInputMode("touch")
+      : touchPressMode;
+    touchPressMode = mode;
+
+    if (mode === "touch") {
+      sendTouchBatch(e.changedTouches, "down");
+      return;
     }
-    sendTouchBatch(e.changedTouches, "down");
+    if (e.touches.length > e.changedTouches.length) return;
+
+    sendMouseMoveFromTouch(e.changedTouches[0]);
+    if (mode === "rapid") {
+      startRapidClick("left");
+    } else {
+      sendControl({ type: "mouseButton", button: "left", action: "down" });
+    }
   },
   { passive: false }
 );
@@ -435,14 +516,12 @@ videoEl.addEventListener(
   "touchmove",
   (e) => {
     e.preventDefault();
-    if (inputSelect.value === 'mouse') {
-      const rect = getVideoContentRect();
-      const x = Math.max(Math.min((e.changedTouches[0].clientX - rect.left) / rect.width, 1), 0);
-      const y = Math.max(Math.min((e.changedTouches[0].clientY - rect.top) / rect.height, 1), 0);
-      sendControl({ type: "mouseMove", mode: "absolute", x, y });
-      return
+    const mode = touchPressMode ?? resolveInputMode("touch");
+    if (mode === "touch") {
+      sendTouchBatch(e.changedTouches, "move");
+      return;
     }
-    sendTouchBatch(e.changedTouches, "move");
+    sendMouseMoveFromTouch(e.changedTouches[0]);
   },
   { passive: false }
 );
@@ -451,15 +530,21 @@ videoEl.addEventListener(
   "touchend",
   (e) => {
     e.preventDefault();
-    if (inputSelect.value === 'mouse') {
-      const rect = getVideoContentRect();
-      const x = Math.max(Math.min((e.changedTouches[0].clientX - rect.left) / rect.width, 1), 0);
-      const y = Math.max(Math.min((e.changedTouches[0].clientY - rect.top) / rect.height, 1), 0);
-      sendControl({ type: "mouseMove", mode: "absolute", x, y });
-      sendControl({ type: "mouseButton", button: "left", action: "up" });
-      return
+    const mode = touchPressMode ?? resolveInputMode("touch");
+    if (e.touches.length === 0) touchPressMode = null;
+
+    if (mode === "touch") {
+      sendTouchBatch(e.changedTouches, "up");
+      return;
     }
-    sendTouchBatch(e.changedTouches, "up");
+    if (e.touches.length > 0) return;
+
+    sendMouseMoveFromTouch(e.changedTouches[0]);
+    if (mode === "rapid") {
+      stopRapidClick();
+    } else {
+      sendControl({ type: "mouseButton", button: "left", action: "up" });
+    }
   },
   { passive: false }
 );
@@ -468,7 +553,16 @@ videoEl.addEventListener(
   "touchcancel",
   (e) => {
     e.preventDefault();
-    sendTouchBatch(e.changedTouches, "cancel");
+    const mode = touchPressMode ?? resolveInputMode("touch");
+    if (e.touches.length === 0) touchPressMode = null;
+
+    if (mode === "touch") {
+      sendTouchBatch(e.changedTouches, "cancel");
+    } else if (mode === "rapid") {
+      stopRapidClick();
+    } else if (e.touches.length === 0) {
+      sendControl({ type: "mouseButton", button: "left", action: "up" });
+    }
   },
   { passive: false }
 );
@@ -484,6 +578,13 @@ const switchSourceBtn = document.getElementById("switchSourceBtn");
 const fullscreenBtn = document.getElementById("fullscreenBtn");
 const screenshotBtn = document.getElementById("screenshotBtn");
 const forceFitBtn = document.getElementById("forceFitBtn");
+const rotateBtn = document.getElementById("rotateBtn");
+
+rotateBtn.addEventListener("click", () => {
+  rotated = !rotated;
+  videoEl.classList.toggle("rotated", rotated);
+  scheduleSendViewportSize();
+});
 
 applyBitrateBtn.addEventListener("click", () => {
   const kbps = parseInt(bitrateInput.value, 10);

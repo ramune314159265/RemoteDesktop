@@ -126,6 +126,13 @@ video {
   object-fit: contain;
 }
 
+video.rotated {
+  width: 100dvh;
+  height: 100dvw;
+  flex: none;
+  transform: rotate(90deg);
+}
+
 .log-wrap {
   background: #1e1e1e;
   border-radius: 8px;
