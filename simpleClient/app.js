@@ -862,176 +862,110 @@ setInterval(async () => {
 }, STATS_INTERVAL_MS);
 
 
-const mediaPanel = document.getElementById("mediaPanel");
-const mediaList = document.getElementById("mediaList");
-const mediaCards = new Map();
+const mediaSessionApi = "mediaSession" in navigator ? navigator.mediaSession : null;
 const mediaThumbs = new Map();
+let currentMedia = null;
+let lastMediaSignature = "";
 
-function formatMediaTime(ms) {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(total / 60);
-  const seconds = String(total % 60).padStart(2, "0");
-  return `${minutes}:${seconds}`;
+function selectMediaSession(msg) {
+  const sessions = Array.isArray(msg.sessions) ? msg.sessions : [];
+  return sessions.find((s) => s.id === msg.current)
+    ?? sessions.find((s) => s.status === "playing")
+    ?? sessions[0]
+    ?? null;
 }
 
-function mediaButton(label, title, onClick) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "media-btn";
-  button.textContent = label;
-  button.title = title;
-  button.addEventListener("click", onClick);
-  return button;
+function estimatedMediaPositionMs() {
+  if (!currentMedia) return 0;
+  const { session, receivedAt } = currentMedia;
+  let position = session.positionMs;
+  if (session.status === "playing") position += (performance.now() - receivedAt) * (session.rate || 1);
+  return Math.min(Math.max(position, 0), session.durationMs || position);
 }
 
-function createMediaCard(id) {
-  const root = document.createElement("div");
-  root.className = "media-card";
-
-  const thumb = document.createElement("img");
-  thumb.className = "media-thumb";
-  thumb.alt = "";
-  thumb.hidden = true;
-
-  const info = document.createElement("div");
-  info.className = "media-info";
-  const title = document.createElement("div");
-  title.className = "media-title";
-  const artist = document.createElement("div");
-  artist.className = "media-artist";
-  const app = document.createElement("div");
-  app.className = "media-app";
-  info.append(title, artist, app);
-
-  const top = document.createElement("div");
-  top.className = "media-top";
-  top.append(thumb, info);
-
-  const progress = document.createElement("input");
-  progress.type = "range";
-  progress.className = "media-progress";
-  progress.min = "0";
-  progress.value = "0";
-
-  const times = document.createElement("div");
-  times.className = "media-times";
-  const position = document.createElement("span");
-  const duration = document.createElement("span");
-  times.append(position, duration);
-
-  const card = { id, root, thumb, title, artist, app, progress, position, duration, dragging: false, state: null, receivedAt: 0 };
-
-  progress.addEventListener("input", () => {
-    card.dragging = true;
-    position.textContent = formatMediaTime(Number(progress.value));
-  });
-  progress.addEventListener("change", () => {
-    card.dragging = false;
-    sendControl({ type: "mediaControl", sessionId: id, mediaAction: "seek", positionMs: Number(progress.value) });
-  });
-
-  card.prevBtn = mediaButton("⏮", "前へ", () => sendControl({ type: "mediaControl", sessionId: id, mediaAction: "previous" }));
-  card.playBtn = mediaButton("▶", "再生", () => {
-    const playing = card.state?.status === "playing";
-    sendControl({ type: "mediaControl", sessionId: id, mediaAction: playing ? "pause" : "play" });
-  });
-  card.nextBtn = mediaButton("⏭", "次へ", () => sendControl({ type: "mediaControl", sessionId: id, mediaAction: "next" }));
-
-  const buttons = document.createElement("div");
-  buttons.className = "media-buttons";
-  buttons.append(card.prevBtn, card.playBtn, card.nextBtn);
-
-  root.append(top, progress, times, buttons);
-  return card;
+function sendMediaControl(mediaAction, positionMs) {
+  if (!currentMedia) return;
+  sendControl({ type: "mediaControl", sessionId: currentMedia.session.id, mediaAction, positionMs });
 }
 
-function updateMediaThumb(card) {
-  const thumb = mediaThumbs.get(card.id);
-  const image = thumb && card.state && thumb.key === card.state.thumbKey ? thumb.image : null;
-  if (typeof image === "string" && image.startsWith("data:image/jpeg;base64,")) {
-    card.thumb.src = image;
-    card.thumb.hidden = false;
-  } else {
-    card.thumb.removeAttribute("src");
-    card.thumb.hidden = true;
+function setMediaAction(action, enabled, handler) {
+  try {
+    mediaSessionApi.setActionHandler(action, enabled ? handler : null);
+  } catch { }
+}
+
+function updateMediaSession() {
+  if (!mediaSessionApi) return;
+
+  if (!currentMedia) {
+    lastMediaSignature = "";
+    mediaSessionApi.metadata = null;
+    mediaSessionApi.playbackState = "none";
+    for (const action of ["play", "pause", "previoustrack", "nexttrack", "seekto", "seekbackward", "seekforward"]) {
+      setMediaAction(action, false);
+    }
+    return;
   }
+
+  const session = currentMedia.session;
+  const thumb = mediaThumbs.get(session.id);
+  const image = thumb && thumb.key === session.thumbKey ? thumb.image : null;
+  const hasImage = typeof image === "string" && image.startsWith("data:image/jpeg;base64,");
+
+  const signature = [session.id, session.title, session.artist, session.album, hasImage ? "img" : "noimg"].join("|");
+  if (signature !== lastMediaSignature) {
+    lastMediaSignature = signature;
+    mediaSessionApi.metadata = new MediaMetadata({
+      title: session.title || "",
+      artist: session.artist || "",
+      album: session.album || "",
+      artwork: hasImage ? [{ src: image, sizes: "200x200", type: "image/jpeg" }] : [],
+    });
+  }
+
+  mediaSessionApi.playbackState = session.status === "playing" ? "playing" : session.status === "paused" ? "paused" : "none";
+
+  try {
+    if (session.durationMs > 0) {
+      mediaSessionApi.setPositionState({
+        duration: session.durationMs / 1000,
+        playbackRate: session.rate || 1,
+        position: estimatedMediaPositionMs() / 1000,
+      });
+    } else {
+      mediaSessionApi.setPositionState();
+    }
+  } catch { }
+
+  setMediaAction("play", session.canPlay, () => sendMediaControl("play"));
+  setMediaAction("pause", session.canPause, () => sendMediaControl("pause"));
+  setMediaAction("previoustrack", session.canPrevious, () => sendMediaControl("previous"));
+  setMediaAction("nexttrack", session.canNext, () => sendMediaControl("next"));
+  setMediaAction("seekto", session.canSeek, (details) => sendMediaControl("seek", details.seekTime * 1000));
+  setMediaAction("seekbackward", session.canSeek, (details) =>
+    sendMediaControl("seek", Math.max(0, estimatedMediaPositionMs() - (details.seekOffset ?? 10) * 1000)));
+  setMediaAction("seekforward", session.canSeek, (details) =>
+    sendMediaControl("seek", Math.min(session.durationMs, estimatedMediaPositionMs() + (details.seekOffset ?? 10) * 1000)));
 }
 
 function applyMediaState(msg) {
-  const sessions = Array.isArray(msg.sessions) ? msg.sessions : [];
-  const ids = new Set(sessions.map((s) => s.id));
+  const session = selectMediaSession(msg);
+  currentMedia = session ? { session, receivedAt: performance.now() } : null;
 
-  for (const [id, card] of mediaCards) {
-    if (!ids.has(id)) {
-      card.root.remove();
-      mediaCards.delete(id);
-      mediaThumbs.delete(id);
-    }
+  const ids = new Set((msg.sessions ?? []).map((s) => s.id));
+  for (const id of mediaThumbs.keys()) {
+    if (!ids.has(id)) mediaThumbs.delete(id);
   }
-
-  const receivedAt = performance.now();
-  for (const state of sessions) {
-    let card = mediaCards.get(state.id);
-    if (!card) {
-      card = createMediaCard(state.id);
-      mediaCards.set(state.id, card);
-      mediaList.append(card.root);
-    }
-    card.state = state;
-    card.receivedAt = receivedAt;
-
-    card.title.textContent = state.title || "(タイトルなし)";
-    card.artist.textContent = [state.artist, state.album].filter(Boolean).join(" - ");
-    card.app.textContent = state.app;
-    card.root.classList.toggle("media-card--current", state.id === msg.current);
-
-    const playing = state.status === "playing";
-    card.playBtn.textContent = playing ? "⏸" : "▶";
-    card.playBtn.title = playing ? "一時停止" : "再生";
-    card.playBtn.disabled = playing ? !state.canPause : !state.canPlay;
-    card.prevBtn.disabled = !state.canPrevious;
-    card.nextBtn.disabled = !state.canNext;
-
-    const hasProgress = state.durationMs > 0;
-    card.progress.hidden = !hasProgress;
-    card.position.parentElement.hidden = !hasProgress;
-    card.progress.max = String(state.durationMs);
-    card.progress.disabled = !state.canSeek;
-    card.duration.textContent = formatMediaTime(state.durationMs);
-
-    updateMediaThumb(card);
-  }
-
-  mediaPanel.hidden = mediaCards.size === 0;
-  updateMediaProgress();
+  updateMediaSession();
 }
 
 function applyMediaThumbnail(msg) {
   mediaThumbs.set(msg.id, { key: msg.thumbKey, image: msg.image });
-  const card = mediaCards.get(msg.id);
-  if (card) updateMediaThumb(card);
+  if (currentMedia?.session.id === msg.id) updateMediaSession();
 }
-
-function updateMediaProgress() {
-  const now = performance.now();
-  for (const card of mediaCards.values()) {
-    const state = card.state;
-    if (!state || state.durationMs <= 0 || card.dragging) continue;
-
-    let position = state.positionMs;
-    if (state.status === "playing") position += (now - card.receivedAt) * (state.rate || 1);
-    position = Math.min(Math.max(position, 0), state.durationMs);
-
-    card.progress.value = String(position);
-    card.position.textContent = formatMediaTime(position);
-  }
-}
-
-setInterval(updateMediaProgress, 500);
 
 function clearMedia() {
-  for (const card of mediaCards.values()) card.root.remove();
-  mediaCards.clear();
+  currentMedia = null;
   mediaThumbs.clear();
-  mediaPanel.hidden = true;
+  updateMediaSession();
 }
