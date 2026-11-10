@@ -47,6 +47,18 @@ internal sealed class ControlMessage
     [JsonPropertyName("bitrateKbps")]
     public uint? BitrateKbps { get; set; }
 
+    /// <summary>mediaControl 用。対象のメディアセッション ID。</summary>
+    [JsonPropertyName("sessionId")]
+    public string? SessionId { get; set; }
+
+    /// <summary>mediaControl 用。"play" | "pause" | "toggle" | "next" | "previous" | "seek"</summary>
+    [JsonPropertyName("mediaAction")]
+    public string? MediaAction { get; set; }
+
+    /// <summary>mediaControl (seek) 用。再生位置(ミリ秒)。</summary>
+    [JsonPropertyName("positionMs")]
+    public double? PositionMs { get; set; }
+
     /// <summary>setMute 用。</summary>
     [JsonPropertyName("muted")]
     public bool? Muted { get; set; }

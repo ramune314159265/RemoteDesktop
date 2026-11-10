@@ -78,6 +78,7 @@ internal sealed class WebRtcSession : IDisposable
     private (int Width, int Height)? _independentWindowSize;
     private readonly System.Collections.Concurrent.BlockingCollection<Action> _controlWork = new();
     private readonly object _viewportLock = new();
+    private Action<string>? _mediaHandler;
     private (int Width, int Height)? _pendingViewport;
     private const int WindowSizeTolerance = 2;
     private const int MaxResizeAttempts = 3;
@@ -340,6 +341,8 @@ internal sealed class WebRtcSession : IDisposable
             {
                 _isControlChannelOpen = true;
                 Console.WriteLine("[Input] Control data channel open");
+                _mediaHandler = SendMediaMessage;
+                var mediaTask = MediaSessionMonitor.Instance.AttachAsync(_mediaHandler);
                 if (_config.StartupBurstMs > 0 && _config.EnablePlayoutDelay)
                 {
                     var burstTask = StartupBurstAsync();
@@ -394,6 +397,10 @@ internal sealed class WebRtcSession : IDisposable
 
                 case "switchSource":
                     EnqueueControlWork(() => SwitchSource(msg));
+                    break;
+
+                case "mediaControl":
+                    var mediaControlTask = MediaSessionMonitor.Instance.ControlAsync(msg.SessionId, msg.MediaAction, msg.PositionMs);
                     break;
 
                 case "listSources":
@@ -993,6 +1000,12 @@ internal sealed class WebRtcSession : IDisposable
     /// 配信元として選べるもの(モニター / ウィンドウ)を1つのメッセージにまとめてクライアントへ送る。
     /// current は現在の配信元("monitor:N" / "window:HANDLE" / "none")で、クライアントの選択状態の復元に使う。
     /// </summary>
+    private void SendMediaMessage(string json)
+    {
+        if (_controlChannelHandle == IntPtr.Zero || !_isControlChannelOpen) return;
+        GstNativeInterop.DataChannelSendString(_controlChannelHandle, json);
+    }
+
     private void SendSourceList()
     {
         if (_controlChannelHandle == IntPtr.Zero || !_isControlChannelOpen) return;
@@ -1382,6 +1395,7 @@ internal sealed class WebRtcSession : IDisposable
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _resizeWatchTimer?.Dispose();
         _controlWork.CompleteAdding();
+        if (_mediaHandler is not null) MediaSessionMonitor.Instance.Detach(_mediaHandler);
         lock (_windowLock)
         {
             _windowStateDisposed = true;

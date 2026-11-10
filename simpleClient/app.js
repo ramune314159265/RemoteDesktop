@@ -210,6 +210,7 @@ function connect() {
 
 function cleanupPeer() {
   stopRapidClick();
+  clearMedia();
   burstPending = false;
   if (pc) {
     pc.close();
@@ -346,14 +347,14 @@ function getVideoLayout() {
 
 /**
  * 画面上の座標を、映像自身の向きでの正規化座標(0〜1)へ変換する。
- * 90度(時計回り)回転中は、見た目の下方向が映像の右方向になる。
+ * 90度(反時計回り)回転中は、見た目の上方向が映像の右方向になる。
  */
 function clientToVideoPoint(clientX, clientY) {
   const { rect, cw, ch } = getVideoLayout();
   const dx = clientX - (rect.left + rect.width / 2);
   const dy = clientY - (rect.top + rect.height / 2);
-  const u = rotated ? dy : dx;
-  const v = rotated ? -dx : dy;
+  const u = rotated ? -dy : dx;
+  const v = rotated ? dx : dy;
   return { x: (u + cw / 2) / cw, y: (v + ch / 2) / ch };
 }
 
@@ -681,6 +682,15 @@ function handleControlChannelMessage(data) {
     return;
   }
 
+  if (msg.type === "mediaState") {
+    applyMediaState(msg);
+    return;
+  }
+  if (msg.type === "mediaThumbnail") {
+    applyMediaThumbnail(msg);
+    return;
+  }
+
   if (msg.type === "sourceList") {
     sourceSelect.innerHTML = "";
     addOptionGroup(
@@ -850,3 +860,178 @@ setInterval(async () => {
 
   prevInbound = cur;
 }, STATS_INTERVAL_MS);
+
+
+const mediaPanel = document.getElementById("mediaPanel");
+const mediaList = document.getElementById("mediaList");
+const mediaCards = new Map();
+const mediaThumbs = new Map();
+
+function formatMediaTime(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = String(total % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function mediaButton(label, title, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "media-btn";
+  button.textContent = label;
+  button.title = title;
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function createMediaCard(id) {
+  const root = document.createElement("div");
+  root.className = "media-card";
+
+  const thumb = document.createElement("img");
+  thumb.className = "media-thumb";
+  thumb.alt = "";
+  thumb.hidden = true;
+
+  const info = document.createElement("div");
+  info.className = "media-info";
+  const title = document.createElement("div");
+  title.className = "media-title";
+  const artist = document.createElement("div");
+  artist.className = "media-artist";
+  const app = document.createElement("div");
+  app.className = "media-app";
+  info.append(title, artist, app);
+
+  const top = document.createElement("div");
+  top.className = "media-top";
+  top.append(thumb, info);
+
+  const progress = document.createElement("input");
+  progress.type = "range";
+  progress.className = "media-progress";
+  progress.min = "0";
+  progress.value = "0";
+
+  const times = document.createElement("div");
+  times.className = "media-times";
+  const position = document.createElement("span");
+  const duration = document.createElement("span");
+  times.append(position, duration);
+
+  const card = { id, root, thumb, title, artist, app, progress, position, duration, dragging: false, state: null, receivedAt: 0 };
+
+  progress.addEventListener("input", () => {
+    card.dragging = true;
+    position.textContent = formatMediaTime(Number(progress.value));
+  });
+  progress.addEventListener("change", () => {
+    card.dragging = false;
+    sendControl({ type: "mediaControl", sessionId: id, mediaAction: "seek", positionMs: Number(progress.value) });
+  });
+
+  card.prevBtn = mediaButton("⏮", "前へ", () => sendControl({ type: "mediaControl", sessionId: id, mediaAction: "previous" }));
+  card.playBtn = mediaButton("▶", "再生", () => {
+    const playing = card.state?.status === "playing";
+    sendControl({ type: "mediaControl", sessionId: id, mediaAction: playing ? "pause" : "play" });
+  });
+  card.nextBtn = mediaButton("⏭", "次へ", () => sendControl({ type: "mediaControl", sessionId: id, mediaAction: "next" }));
+
+  const buttons = document.createElement("div");
+  buttons.className = "media-buttons";
+  buttons.append(card.prevBtn, card.playBtn, card.nextBtn);
+
+  root.append(top, progress, times, buttons);
+  return card;
+}
+
+function updateMediaThumb(card) {
+  const thumb = mediaThumbs.get(card.id);
+  const image = thumb && card.state && thumb.key === card.state.thumbKey ? thumb.image : null;
+  if (typeof image === "string" && image.startsWith("data:image/jpeg;base64,")) {
+    card.thumb.src = image;
+    card.thumb.hidden = false;
+  } else {
+    card.thumb.removeAttribute("src");
+    card.thumb.hidden = true;
+  }
+}
+
+function applyMediaState(msg) {
+  const sessions = Array.isArray(msg.sessions) ? msg.sessions : [];
+  const ids = new Set(sessions.map((s) => s.id));
+
+  for (const [id, card] of mediaCards) {
+    if (!ids.has(id)) {
+      card.root.remove();
+      mediaCards.delete(id);
+      mediaThumbs.delete(id);
+    }
+  }
+
+  const receivedAt = performance.now();
+  for (const state of sessions) {
+    let card = mediaCards.get(state.id);
+    if (!card) {
+      card = createMediaCard(state.id);
+      mediaCards.set(state.id, card);
+      mediaList.append(card.root);
+    }
+    card.state = state;
+    card.receivedAt = receivedAt;
+
+    card.title.textContent = state.title || "(タイトルなし)";
+    card.artist.textContent = [state.artist, state.album].filter(Boolean).join(" - ");
+    card.app.textContent = state.app;
+    card.root.classList.toggle("media-card--current", state.id === msg.current);
+
+    const playing = state.status === "playing";
+    card.playBtn.textContent = playing ? "⏸" : "▶";
+    card.playBtn.title = playing ? "一時停止" : "再生";
+    card.playBtn.disabled = playing ? !state.canPause : !state.canPlay;
+    card.prevBtn.disabled = !state.canPrevious;
+    card.nextBtn.disabled = !state.canNext;
+
+    const hasProgress = state.durationMs > 0;
+    card.progress.hidden = !hasProgress;
+    card.position.parentElement.hidden = !hasProgress;
+    card.progress.max = String(state.durationMs);
+    card.progress.disabled = !state.canSeek;
+    card.duration.textContent = formatMediaTime(state.durationMs);
+
+    updateMediaThumb(card);
+  }
+
+  mediaPanel.hidden = mediaCards.size === 0;
+  updateMediaProgress();
+}
+
+function applyMediaThumbnail(msg) {
+  mediaThumbs.set(msg.id, { key: msg.thumbKey, image: msg.image });
+  const card = mediaCards.get(msg.id);
+  if (card) updateMediaThumb(card);
+}
+
+function updateMediaProgress() {
+  const now = performance.now();
+  for (const card of mediaCards.values()) {
+    const state = card.state;
+    if (!state || state.durationMs <= 0 || card.dragging) continue;
+
+    let position = state.positionMs;
+    if (state.status === "playing") position += (now - card.receivedAt) * (state.rate || 1);
+    position = Math.min(Math.max(position, 0), state.durationMs);
+
+    card.progress.value = String(position);
+    card.position.textContent = formatMediaTime(position);
+  }
+}
+
+setInterval(updateMediaProgress, 500);
+
+function clearMedia() {
+  for (const card of mediaCards.values()) card.root.remove();
+  mediaCards.clear();
+  mediaThumbs.clear();
+  mediaPanel.hidden = true;
+}
