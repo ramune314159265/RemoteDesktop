@@ -356,6 +356,7 @@ internal sealed class WebRtcSession : IDisposable
             {
                 _isControlChannelOpen = false;
                 Console.WriteLine("[Input] Control data channel closed");
+                InputInjector.ReleaseAll();
             }
             catch (Exception ex) { Console.WriteLine($"[Input][FATAL in onControlChannelClose] {ex}"); }
         };
@@ -559,6 +560,8 @@ internal sealed class WebRtcSession : IDisposable
                 return;
             }
 
+            var blackEntered = EnterBlack();
+
             WindowEnumerator.RestoreIfMinimized(hwnd);
 
             if (_currentWindowHandle != hwnd)
@@ -571,7 +574,6 @@ internal sealed class WebRtcSession : IDisposable
                 _trackedWindowHandle = hwnd;
                 _originalStyleBits = ScreenGeometry.GetOverlappedStyleBits(hwnd);
                 _stripSucceeded = false;
-                WindowStyleRecovery.Save(hwnd, _originalStyleBits, _originalWindowRect);
 
                 MoveWindowToTargetMonitor(hwnd);
 
@@ -586,7 +588,7 @@ internal sealed class WebRtcSession : IDisposable
             {
                 GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", msg.WindowHandle.Value);
             });
-            EnableCaptureInput();
+            if (!blackEntered) EnableCaptureInput();
 
             var clientRect = ApplyWindowChromeCrop(hwnd);
             InputInjector.SetCaptureRegion(clientRect ?? ScreenGeometry.PrimaryMonitorFallback);
@@ -594,6 +596,7 @@ internal sealed class WebRtcSession : IDisposable
             _lastKnownWindowRect = clientRect;
 
             _lastRequestedWindowSize = ScreenGeometry.GetWindowRectSafe(hwnd) is { } wr ? (wr.Width, wr.Height) : null;
+            if (blackEntered) HoldBlackUntilFit();
             SendWindowResized(clientRect.Value.Width, clientRect.Value.Height);
         }
         else if (msg.SourceMode == "monitor" && msg.MonitorIndex.HasValue)
@@ -606,10 +609,14 @@ internal sealed class WebRtcSession : IDisposable
                 return;
             }
 
+            var targetMonitorRect = ScreenGeometry.GetMonitorRect(msg.MonitorIndex.Value);
+            var sameResolution = targetMonitorRect is not { } tr
+                || (_captureWidth == tr.Width && _captureHeight == tr.Height);
+            var blackEntered = (_currentWindowHandle is not null || sameResolution) && EnterBlack();
+
             RestoreOriginalWindowRectIfNeeded();
 
-            var targetMonitorRect = ScreenGeometry.GetMonitorRect(msg.MonitorIndex.Value);
-            SwitchCaptureViaBlack(targetMonitorRect?.Width ?? 0, targetMonitorRect?.Height ?? 0, () =>
+            ApplySourceSwitch(() =>
             {
                 GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", 0);
                 GstNativeInterop.SetInt(_captureSourceHandle, "monitor-index", msg.MonitorIndex.Value);
@@ -621,9 +628,13 @@ internal sealed class WebRtcSession : IDisposable
             _currentWindowHandle = null;
             _lastKnownWindowRect = null;
             ResetWindowChromeCrop();
+
+            if (blackEntered) ShowCapture();
+            else EnableCaptureInput();
         }
         else if (msg.SourceMode == "none")
         {
+            EnterBlack();
             RestoreOriginalWindowRectIfNeeded();
             _currentWindowHandle = null;
             _lastKnownWindowRect = null;
@@ -737,8 +748,8 @@ internal sealed class WebRtcSession : IDisposable
     {
         var monitorRect = ScreenGeometry.GetMonitorRect(ResolveWindowTargetMonitorIndex()) ?? ScreenGeometry.PrimaryMonitorFallback;
 
-        var windowWidth = clientWidth;
-        var windowHeight = clientHeight + _videoCropTopPixels;
+        var windowWidth = Math.Max(2, clientWidth & ~1);
+        var windowHeight = Math.Max(2, (clientHeight & ~1) + _videoCropTopPixels);
 
         var x = monitorRect.X + Math.Max(0, (monitorRect.Width - windowWidth) / 2);
         var y = monitorRect.Y + Math.Max(0, (monitorRect.Height - windowHeight) / 2);
@@ -779,12 +790,18 @@ internal sealed class WebRtcSession : IDisposable
         var finalSize = actual ?? requested;
         var sizeChanged = before is null
             || !IsSimilarSize((before.Value.Width, before.Value.Height), finalSize);
-        if (!sizeChanged) return;
+        if (!sizeChanged)
+        {
+            ShowCapture();
+            return;
+        }
 
+        var blackEntered = EnterBlack();
         ApplySourceSwitch(() =>
         {
             GstNativeInterop.SetUInt64(_captureSourceHandle, "window-handle", (ulong)hwnd.ToInt64());
         });
+        if (blackEntered) ShowCapture();
     }
 
     private static bool IsSimilarSize((int Width, int Height) a, (int Width, int Height) b)
@@ -820,8 +837,6 @@ internal sealed class WebRtcSession : IDisposable
                         ScreenGeometry.MoveResizeWindow(hwnd, orig.X, orig.Y, orig.Width, orig.Height);
                     }
                 }
-
-                WindowStyleRecovery.Remove(hwnd);
             }
 
             _trackedWindowHandle = null;
@@ -834,29 +849,75 @@ internal sealed class WebRtcSession : IDisposable
         }
     }
 
-    /// <summary>
-    /// キャプチャ元の切り替え。切り替え前後で解像度が同じ(例: 同じ解像度のモニター同士)だと
-    /// エンコーダ/下流が「流れが途切れた」ことに気付けず映像が固まることがあったため、
-    /// 一旦黒画面(解像度が異なる)を経由して、エンコーダを確実に再ネゴシエーションさせる。
-    /// (解像度が変わる切り替え=ウィンドウ経由では固まらないことが確認できているため、同じ経路にする)
-    /// </summary>
-    private void SwitchCaptureViaBlack(int targetWidth, int targetHeight, Action applyProperties)
-    {
-        var sameResolution = targetWidth <= 0 || targetHeight <= 0
-            || (_captureWidth == targetWidth && _captureHeight == targetHeight);
+    private const int BlackSettleMs = 150;
+    private const int CaptureWarmupMs = 250;
+    private const int BlackHoldTimeoutMs = 2500;
+    private bool _blackShown;
+    private Timer? _blackHoldTimer;
 
-        var bridged = false;
-        if (sameResolution && !_videoDisabled && !_burstActive && _videoSelectorHandle != IntPtr.Zero && _blackSelPad is not null)
+    /// <summary>
+    /// 配信元の切り替え中に、ウィンドウの移動・リサイズ・タイトルバーの除去やキャプチャの再起動の途中経過が
+    /// 見えないよう、映像を黒画面に切り替える。すでに黒画面(または映像なし)なら何もしない。
+    /// 接続時テスト映像の最中は切り替えず、false を返す。
+    /// </summary>
+    private bool EnterBlack()
+    {
+        if (_blackShown) return true;
+        if (_burstActive || _videoSelectorHandle == IntPtr.Zero || _blackSelPad is null) return false;
+
+        if (_videoDisabled)
         {
-            GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _blackSelPad.Handle);
-            bridged = true;
-            Thread.Sleep(200);
+            _blackShown = true;
+            return true;
         }
 
-        ApplySourceSwitch(applyProperties);
+        GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _blackSelPad.Handle);
+        _blackShown = true;
+        Thread.Sleep(BlackSettleMs);
+        return true;
+    }
 
-        if (bridged) _videoDisabled = true;
-        EnableCaptureInput();
+    /// <summary>
+    /// 黒画面からキャプチャ映像へ戻す。再起動直後は古いフレームがキャッシュに残っていることがあるため、
+    /// 新しいフレームが届くのを少し待ってから切り替える。
+    /// </summary>
+    private void ShowCapture()
+    {
+        if (!_blackShown) return;
+        Thread.Sleep(CaptureWarmupMs);
+
+        _blackHoldTimer?.Dispose();
+        _blackHoldTimer = null;
+        _blackShown = false;
+        _videoDisabled = false;
+        InputInjector.Enabled = true;
+
+        if (_videoSelectorHandle != IntPtr.Zero && _captureSelPad is not null)
+        {
+            GstNativeInterop.SetObject(_videoSelectorHandle, "active-pad", _captureSelPad.Handle);
+        }
+    }
+
+    /// <summary>
+    /// ウィンドウ配信への切り替え後は、クライアントからのサイズ指定が反映されるまで黒画面のままにする。
+    /// サイズ指定が届かない場合に備えて、一定時間後には自動で映像へ戻す。
+    /// </summary>
+    private void HoldBlackUntilFit()
+    {
+        _blackHoldTimer?.Dispose();
+        _blackHoldTimer = new Timer(_ =>
+        {
+            try
+            {
+                lock (_windowLock)
+                {
+                    if (_windowStateDisposed || !_blackShown) return;
+                    Console.WriteLine("[Config] No fit request arrived, showing the capture");
+                    ShowCapture();
+                }
+            }
+            catch (Exception ex) { Console.WriteLine($"[Config] Failed to leave black screen: {ex.Message}"); }
+        }, null, BlackHoldTimeoutMs, Timeout.Infinite);
     }
 
     /// <summary>capturesrc だけを READY に落とし、プロパティ変更後 PLAYING へ戻す共通処理。</summary>
@@ -1394,7 +1455,9 @@ internal sealed class WebRtcSession : IDisposable
     {
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _resizeWatchTimer?.Dispose();
+        _blackHoldTimer?.Dispose();
         _controlWork.CompleteAdding();
+        InputInjector.ReleaseAll();
         if (_mediaHandler is not null) MediaSessionMonitor.Instance.Detach(_mediaHandler);
         lock (_windowLock)
         {

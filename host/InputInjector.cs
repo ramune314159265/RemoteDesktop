@@ -525,6 +525,46 @@ internal static class InputInjector
         SendInput(1, new[] { input }, InputSize);
     }
 
+    private static readonly object PressedLock = new();
+    private static readonly HashSet<string> PressedButtons = new();
+    private static readonly HashSet<ushort> PressedKeys = new();
+
+    /// <summary>
+    /// 押されたままのマウスボタン・キー・タッチをすべて離す。
+    /// 押している最中に切断されると「離す」操作が届かず、入力が押しっぱなしになるため、切断時に呼ぶ。
+    /// </summary>
+    public static void ReleaseAll()
+    {
+        try
+        {
+            string[] buttons;
+            ushort[] keys;
+            lock (PressedLock)
+            {
+                buttons = PressedButtons.ToArray();
+                keys = PressedKeys.ToArray();
+            }
+
+            foreach (var button in buttons) SendMouseButton(button, "up");
+            foreach (var key in keys) SendVirtualKey(key, down: false);
+
+            var hadTouches = false;
+            lock (TouchLock)
+            {
+                foreach (var id in ActiveTouches.Keys)
+                {
+                    PendingEndingIds.Add(id);
+                    hadTouches = true;
+                }
+            }
+            if (hadTouches) TouchWakeEvent.Set();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Input] ReleaseAll failed: {ex.Message}");
+        }
+    }
+
     private static void SendMouseButton(string? button, string? action)
     {
         uint flags = (button, action) switch
@@ -542,6 +582,12 @@ internal static class InputInjector
         {
             Console.WriteLine($"[Input] Unknown mouse button/action: {button}/{action}");
             return;
+        }
+
+        lock (PressedLock)
+        {
+            if (action == "down" && button is not null) PressedButtons.Add(button);
+            else if (button is not null) PressedButtons.Remove(button);
         }
 
         var input = new INPUT { type = INPUT_MOUSE, U = new InputUnion { mi = new MOUSEINPUT { dwFlags = flags } } };
@@ -571,6 +617,17 @@ internal static class InputInjector
         {
             Console.WriteLine($"[Input] Unknown key code: {jsCode}");
             return;
+        }
+
+        SendVirtualKey(vk, down);
+    }
+
+    private static void SendVirtualKey(ushort vk, bool down)
+    {
+        lock (PressedLock)
+        {
+            if (down) PressedKeys.Add(vk);
+            else PressedKeys.Remove(vk);
         }
 
         var input = new INPUT

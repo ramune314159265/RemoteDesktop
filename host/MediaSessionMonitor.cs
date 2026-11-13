@@ -36,6 +36,7 @@ internal sealed class MediaSessionMonitor
     private Timer? _periodicTimer;
     private event Action<string>? MessagePublished;
     private string _lastStateJson = "";
+    private bool _forceNextPublish;
 
     /// <summary>送信先を登録し、現在の状態(サムネイル含む)を送る。初回は監視も開始する。</summary>
     public async Task AttachAsync(Action<string> handler)
@@ -164,7 +165,9 @@ internal sealed class MediaSessionMonitor
 
             lock (_lock)
             {
-                if (onlyTo is null && !force && stateJson == _lastStateJson) return;
+                var forced = force || _forceNextPublish;
+                _forceNextPublish = false;
+                if (onlyTo is null && !forced && stateJson == _lastStateJson) return;
                 _lastStateJson = stateJson;
             }
 
@@ -340,6 +343,7 @@ internal sealed class MediaSessionMonitor
                     Console.WriteLine($"[Media] 未対応の操作: {action}");
                     return;
             }
+            lock (_lock) { _forceNextPublish = true; }
             SchedulePublish();
         }
         catch (Exception ex)

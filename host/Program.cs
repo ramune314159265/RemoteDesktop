@@ -20,11 +20,7 @@ internal static class Program
         try
         {
             var logPath = System.IO.Path.Combine(AppContext.BaseDirectory, "host.log");
-            if (System.IO.File.Exists(logPath) && new System.IO.FileInfo(logPath).Length > 5 * 1024 * 1024)
-            {
-                System.IO.File.Delete(logPath);
-            }
-            var stream = new System.IO.FileStream(logPath, System.IO.FileMode.Append, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite);
+            var stream = new System.IO.FileStream(logPath, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite);
             var writer = System.IO.TextWriter.Synchronized(new System.IO.StreamWriter(stream) { AutoFlush = true });
             Console.SetOut(writer);
             Console.SetError(writer);
@@ -94,7 +90,6 @@ internal static class Program
         if (int.TryParse(windowMonitorSpec, out var wmIndex)) windowMonitorIndex = wmIndex;
         else if (windowMonitorSpec.Length > 0) windowMonitorName = windowMonitorSpec;
 
-        WindowStyleRecovery.RecoverFromPreviousRun();
 
         Application.Init();
         Console.WriteLine($"[Gst] Version: {GstNativeInterop.GetVersionString()}");

@@ -249,10 +249,7 @@ function scheduleSendViewportSize() {
 }
 
 function sendViewportSize() {
-  const { cw, ch } = getVideoLayout();
-  const dpr = window.devicePixelRatio || 1;
-  const width = Math.round(cw * dpr);
-  const height = Math.round(ch * dpr);
+  const { width, height } = getAvailableBoxSizePx();
   if (width > 0 && height > 0) {
     sendViewportSizeIfChanged(width, height);
   }
@@ -277,17 +274,13 @@ window.addEventListener("resize", scheduleSendViewportSize);
 videoEl.addEventListener("loadedmetadata", scheduleSendViewportSize);
 
 /**
- * 現在のレイアウトで video 要素に使える最大の表示領域(デバイスピクセル単位)を返す。
- * ホスト側ウィンドウが自発的にリサイズした直後は、まだ新しい解像度の映像フレームが
- * 届いておらず videoEl の実サイズからは逆算できないため、CSS上の制約
- * (コンテナ幅 / max-height:80vh)から独立に計算する。
+ * ブラウザのウィンドウ(innerWidth / innerHeight)の大きさをデバイスピクセル単位で返す。
+ * video 要素の大きさは映像の解像度やレイアウトに左右されるため参照しない。映像回転中は縦横を入れ替える。
  */
 function getAvailableBoxSizePx() {
   const dpr = window.devicePixelRatio || 1;
-  const containerWidthCss = videoEl.parentElement?.clientWidth ?? videoEl.clientWidth;
-  const maxHeightCss = videoEl.parentElement?.clientHeight ?? videoEl.clientHeight;
-  const width = Math.round(containerWidthCss * dpr);
-  const height = Math.round(maxHeightCss * dpr);
+  const width = Math.round(window.innerWidth * dpr);
+  const height = Math.round(window.innerHeight * dpr);
   return rotated ? { width: height, height: width } : { width, height };
 }
 
@@ -726,7 +719,8 @@ function handleControlChannelMessage(data) {
     const box = getAvailableBoxSizePx();
     const target = computeFitSize(box.width, box.height, msg.width, msg.height);
     log(`Requesting host to fit to: ${target.width}x${target.height}`);
-    sendViewportSizeIfChanged(target.width, target.height);
+    lastSentViewportSize = { width: target.width, height: target.height };
+    sendControl({ type: "setViewportSize", width: target.width, height: target.height });
   } else {
     log("Unknown control channel message:", data);
   }
@@ -862,6 +856,11 @@ setInterval(async () => {
 }, STATS_INTERVAL_MS);
 
 
+videoEl.addEventListener("pause", () => {
+  if (!pc || pc.connectionState === "closed" || videoEl.ended) return;
+  videoEl.play().catch((err) => log("video.play() に失敗:", err.message ?? err));
+});
+
 const mediaSessionApi = "mediaSession" in navigator ? navigator.mediaSession : null;
 const mediaThumbs = new Map();
 let currentMedia = null;
@@ -886,6 +885,7 @@ function estimatedMediaPositionMs() {
 function sendMediaControl(mediaAction, positionMs) {
   if (!currentMedia) return;
   sendControl({ type: "mediaControl", sessionId: currentMedia.session.id, mediaAction, positionMs });
+  setTimeout(() => updateMediaSession(true), 800);
 }
 
 function setMediaAction(action, enabled, handler) {
@@ -894,7 +894,7 @@ function setMediaAction(action, enabled, handler) {
   } catch { }
 }
 
-function updateMediaSession() {
+function updateMediaSession(reapply = false) {
   if (!mediaSessionApi) return;
 
   if (!currentMedia) {
@@ -913,7 +913,7 @@ function updateMediaSession() {
   const hasImage = typeof image === "string" && image.startsWith("data:image/jpeg;base64,");
 
   const signature = [session.id, session.title, session.artist, session.album, hasImage ? "img" : "noimg"].join("|");
-  if (signature !== lastMediaSignature) {
+  if (signature !== lastMediaSignature || reapply) {
     lastMediaSignature = signature;
     mediaSessionApi.metadata = new MediaMetadata({
       title: session.title || "",
@@ -950,6 +950,9 @@ function updateMediaSession() {
 
 function applyMediaState(msg) {
   const session = selectMediaSession(msg);
+  if (session?.id !== currentMedia?.session.id || session?.status !== currentMedia?.session.status) {
+    log("[Media]", session ? `${session.status}: ${session.title}` : "なし");
+  }
   currentMedia = session ? { session, receivedAt: performance.now() } : null;
 
   const ids = new Set((msg.sessions ?? []).map((s) => s.id));
